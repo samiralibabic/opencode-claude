@@ -604,7 +604,10 @@ async function handleChatCompletions(
     cwd,
     model,
     resume: isMetaRequest ? undefined : resume,
-    effort: selection.effort,
+    // Meta requests run with thinking force-disabled; the API rejects
+    // effort "max" in that mode (openchamber/opencode-claude#4). Normal
+    // turns keep their selected effort with adaptive thinking.
+    effort: isMetaRequest ? undefined : selection.effort,
     env,
     mcpServers: isMetaRequest ? undefined : mcpServers,
     autoCompactEnabled: !isMetaRequest,

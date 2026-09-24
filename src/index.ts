@@ -17,6 +17,7 @@ import {
   OPENAI_COMPATIBLE_NPM,
   PROVIDER_ID,
 } from "./constants.js";
+import { deleteBridge, findBridgeByConversation } from "./bridge-pool.js";
 import { detectClaudeCode } from "./detect.js";
 import { installClaudeCli } from "./cli-install.js";
 import {
@@ -262,6 +263,31 @@ export const ClaudeCodePlugin: Plugin = async (
         config as Record<string, any>,
         getClaudeModels(),
       );
+    },
+
+    // Esc-Esc / session.abort tears down the OpenCode-side turn without any
+    // in-flight HTTP request when the bridge is parked mid-tool-call, so the
+    // SSE cancel() path never runs. OpenCode publishes session.idle when the
+    // runner finishes or is interrupted; drop any bridge still live for that
+    // session so the Claude CLI child cannot outlive the abort. Normal turns
+    // delete their bridge before idle fires, making this a no-op.
+    async event({ event }) {
+      const busEvent = event as unknown as {
+        type?: unknown;
+        properties?: { sessionID?: unknown };
+      };
+      if (busEvent?.type !== "session.idle") return;
+      const sessionID = busEvent.properties?.sessionID;
+      if (typeof sessionID !== "string" || !sessionID) return;
+      for (const key of [sessionID, `title:${sessionID}`]) {
+        const bridge = findBridgeByConversation(key);
+        if (!bridge) continue;
+        log.warn(
+          "[opencode-claude] session went idle with a live bridge (aborted turn?) — tearing it down",
+          { conversationKey: key, bridgeId: bridge.id },
+        );
+        deleteBridge(bridge.id);
+      }
     },
 
     "chat.headers": async (hookInput, output) => {

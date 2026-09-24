@@ -309,6 +309,13 @@ export async function startClaudeQuery(
     cwd,
   });
 
+  // Hand the SDK transport its own abort signal. The query handle does not
+  // expose the child pid, so killProcessTree alone cannot guarantee teardown
+  // when the iterator is wedged; abort() makes the SDK run its own
+  // SIGTERM→SIGKILL subprocess cleanup.
+  const abortController = new AbortController();
+  options.abortController = abortController;
+
   let result: any;
   try {
     result = (queryFn as (input: { prompt: unknown; options: unknown }) => unknown)({
@@ -349,6 +356,11 @@ export async function startClaudeQuery(
   const close = () => {
     if (closed) return;
     closed = true;
+    try {
+      abortController.abort();
+    } catch {
+      // ignore
+    }
     killProcessTree(getPid(), { signal: "SIGTERM", force: true });
     if (result && typeof result.return === "function") {
       try {
