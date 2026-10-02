@@ -14,6 +14,7 @@ async function main() {
     CLAUDE_CODE_MODELS,
     buildEffortVariants,
     getClaudeModels,
+    modelsFromSdk,
     resolveClaudeModelId,
   } = await import("../src/models.ts");
   const {
@@ -325,13 +326,17 @@ async function main() {
 
   // Models / effort
   const models = getClaudeModels();
-  assert.ok(models.length >= 4);
-  assert.ok(models.some((m) => m.id === "sonnet"));
-  assert.ok(models.some((m) => m.id === "opus"));
+  assert.ok(models.length > 0);
+  assert.equal(models, CLAUDE_CODE_MODELS);
+  assert.equal(resolveClaudeModelId("claude-opus-5-5[1m]"), "claude-opus-5-5[1m]");
   assert.equal(resolveClaudeModelId("haiku"), "claude-haiku-4-5");
   assert.equal(resolveClaudeModelId("sonnet"), "sonnet");
 
-  const sonnet = CLAUDE_CODE_MODELS.find((m) => m.id === "sonnet")!;
+  const sonnet = modelsFromSdk([{
+    value: "sonnet",
+    resolvedModel: "claude-sonnet-5",
+    supportedEffortLevels: [...EFFORT_LEVELS],
+  }])[0]!;
   const variants = buildEffortVariants(sonnet);
   for (const level of EFFORT_LEVELS) {
     assert.ok(variants[level]);

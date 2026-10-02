@@ -68,6 +68,49 @@ export function resetClaudeAgentSdkCache(): void {
   sdkLoadError = null;
 }
 
+export async function listClaudeSupportedModels(params: {
+  cwd: string;
+  timeoutMs?: number;
+  queryImpl?: SdkModule["query"];
+}): Promise<import("@anthropic-ai/claude-agent-sdk").ModelInfo[]> {
+  const sdk = await loadClaudeAgentSdk();
+  const env = buildClaudeCodeChildEnv(process.env);
+  const abortController = new AbortController();
+  let release!: () => void;
+  const idle = new Promise<void>((resolve) => { release = resolve; });
+  // Initialize the CLI for its control API without submitting an inference prompt.
+  async function* prompt(): AsyncGenerator<import("@anthropic-ai/claude-agent-sdk").SDKUserMessage> {
+    await idle;
+  }
+  const query = (params.queryImpl ?? sdk.query)({
+    prompt: prompt(),
+    options: {
+      cwd: assertClaudeWorkingDirectory(params.cwd),
+      env,
+      pathToClaudeCodeExecutable: resolveClaudeCodeExecutable({ env }) || undefined,
+      abortController,
+      persistSession: false,
+      settingSources: [],
+      strictMcpConfig: true,
+      settings: { disableClaudeAiConnectors: true },
+    },
+  });
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  try {
+    return await Promise.race([
+      query.supportedModels(),
+      new Promise<never>((_, reject) => {
+        timer = setTimeout(() => reject(new Error("Claude model discovery timed out")), params.timeoutMs ?? 15_000);
+      }),
+    ]);
+  } finally {
+    clearTimeout(timer);
+    abortController.abort();
+    release();
+    query.close();
+  }
+}
+
 export async function probeClaudeAgentSdk(): Promise<{
   available: boolean;
   error?: string;

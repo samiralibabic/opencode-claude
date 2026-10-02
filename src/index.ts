@@ -11,7 +11,6 @@
  */
 import type { Hooks, Plugin, PluginInput } from "@opencode-ai/plugin";
 import {
-  DEFAULT_MODEL_ID,
   DIRECTORY_HEADER,
   EFFORT_HEADER,
   OPENAI_COMPATIBLE_NPM,
@@ -33,6 +32,7 @@ import {
   buildConfigVariants,
   buildEffortVariants,
   getClaudeModels,
+  refreshClaudeModels,
   type ClaudeModel,
 } from "./models.js";
 import {
@@ -75,9 +75,7 @@ function buildProviderModel(
       url: baseURL,
       npm: OPENAI_COMPATIBLE_NPM,
     },
-    name: id === DEFAULT_MODEL_ID && model.id !== DEFAULT_MODEL_ID
-      ? `Default (${model.name})`
-      : model.name,
+    name: model.name,
     capabilities: {
       temperature: true,
       // Runtime models expose reasoning so streams can carry thinking deltas.
@@ -109,6 +107,7 @@ function buildProviderModel(
     cost: zeroCost(),
     limit: {
       context: model.contextWindow,
+      ...(model.contextWindow >= 1_000_000 ? { input: Math.round(model.contextWindow * 0.9) } : {}),
       output: model.maxTokens,
     },
     status: "active",
@@ -143,6 +142,7 @@ function buildConfigModelEntry(model: ClaudeModel): Record<string, unknown> {
     },
     limit: {
       context: model.contextWindow,
+      ...(model.contextWindow >= 1_000_000 ? { input: Math.round(model.contextWindow * 0.9) } : {}),
       output: model.maxTokens,
     },
     options: {
@@ -159,15 +159,6 @@ function buildClaudeProviderModels(
   const providerModels = Object.fromEntries(
     models.map((model) => [model.id, buildProviderModel(model, model.id, baseURL)]),
   );
-  const defaultModel =
-    models.find((m) => m.id === DEFAULT_MODEL_ID) || models[0];
-  if (defaultModel && !(DEFAULT_MODEL_ID in providerModels)) {
-    providerModels[DEFAULT_MODEL_ID] = buildProviderModel(
-      defaultModel,
-      DEFAULT_MODEL_ID,
-      baseURL,
-    );
-  }
   return providerModels;
 }
 
@@ -193,15 +184,6 @@ function ensureClaudeProviderConfig(
   const seededModels = Object.fromEntries(
     models.map((model) => [model.id, buildConfigModelEntry(model)]),
   );
-  const defaultModel =
-    models.find((m) => m.id === DEFAULT_MODEL_ID) || models[0];
-  if (defaultModel && !(DEFAULT_MODEL_ID in seededModels)) {
-    seededModels[DEFAULT_MODEL_ID] = {
-      ...buildConfigModelEntry(defaultModel),
-      name: `Default (${defaultModel.name})`,
-    };
-  }
-
   config.provider[PROVIDER_ID] = {
     ...existing,
     name:
@@ -226,8 +208,10 @@ function ensureClaudeProviderConfig(
 
 async function loadClaudeRuntime(
   provider?: { models?: Record<string, unknown> },
+  directory = process.cwd(),
 ): Promise<{ port: number; providerModels: Record<string, unknown> } | undefined> {
   const port = await startProxy();
+  await refreshClaudeModels(directory);
 
   const providerModels = buildClaudeProviderModels(getClaudeModels());
   if (provider) provider.models = providerModels;
@@ -259,6 +243,7 @@ export const ClaudeCodePlugin: Plugin = async (
         );
       }
 
+      if (cliPresent) await refreshClaudeModels(input.directory);
       ensureClaudeProviderConfig(
         config as Record<string, any>,
         getClaudeModels(),
@@ -321,7 +306,7 @@ export const ClaudeCodePlugin: Plugin = async (
     provider: {
       id: PROVIDER_ID,
       async models(provider) {
-        const runtime = await loadClaudeRuntime(provider);
+        const runtime = await loadClaudeRuntime(provider, input.directory);
         return (runtime?.providerModels ?? {}) as Record<string, any>;
       },
     },

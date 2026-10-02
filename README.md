@@ -30,7 +30,7 @@ The OpenCode/OpenChamber sign-in action launches `claude auth login --claudeai` 
 
 ### Pick models and thinking effort
 
-Aliases `fable` / `opus` / `sonnet` / `haiku` plus pinned ids. Native OpenCode variants `low` → `max` map to Claude `--effort` and adaptive thinking.
+Models come from Claude Code's `supportedModels()` during provider initialization, with concrete IDs and only the effort choices it advertises. Known families expose 1M variants through `[1m]`; limits follow the official plugin's family rules. Discovery uses an idle control session, not an inference prompt, and caches its last successful catalog. Restart OpenCode to refresh the picker on this OpenCode 1-compatible branch.
 
 ### Keep agent loops moving
 
@@ -89,10 +89,11 @@ opencode auth login --provider claude-code
 ### 4. Run a Claude model
 
 ```bash
-opencode run "Summarise this repository in five bullets." --model claude-code/sonnet
+opencode models claude-code
+opencode run "Summarise this repository in five bullets." --model claude-code/claude-sonnet-5
 ```
 
-In the TUI, pick provider **claude-code**, choose a model, and set the **effort** variant (`low` / `medium` / `high` / `xhigh` / `max`) when you want deeper thinking.
+In the TUI, pick provider **claude-code**, choose an account-advertised model, and set an available **effort** variant when you want deeper thinking. Existing sessions using an old alias may need a concrete model selected once; discovery does not automatically switch sessions to a newer release.
 
 ### From source (optional)
 
@@ -134,7 +135,7 @@ OpenCode
 | **Proxy** | OpenAI ↔ Agent SDK protocol, tool parking, compact, rate-limit gate |
 | **CLI** | Subscription credentials and the Claude Code harness |
 
-Model catalog: aliases `fable` / `opus` / `sonnet` / `haiku` plus pinned ids. Effort selection is encoded in `x-opencode-claude-effort` so the proxy passes the exact `effort` (and adaptive thinking) into the Agent SDK.
+Model catalog: account discovery, cached at `~/.local/share/opencode-claude/models.json` (or under `XDG_DATA_HOME`), with an offline fallback. Concurrent initialization shares one discovery probe, with a 15-second query timeout and a ten-minute refresh throttle. OpenCode 1 has no supported provider hot-reload hook, so initialization waits for discovery and running pickers update after restart. 1M models declare 900k input and 128k output limits; input and output share the total window. Effort selection is encoded in `x-opencode-claude-effort` so the proxy passes the selected supported effort into the Agent SDK.
 
 ### Rate-limit counter
 
