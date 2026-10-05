@@ -513,7 +513,7 @@ async function handleChatCompletions(
     );
   }
 
-  let resume = getForeignSessionId(conversationKey);
+  let resume = isMetaRequest ? undefined : getForeignSessionId(conversationKey);
   if (resume && !findClaudeSessionFile(resume)) {
     // The claude CLI resumes by looking the session up on disk. A missing
     // transcript (cleanup, different machine, pruned projects dir) would
@@ -735,7 +735,7 @@ async function handleChatCompletions(
           if (raced.kind === "event" && !raced.value.done) {
             const pendingEvent = raced.value.value;
             const pendingSessionId = extractSessionId(pendingEvent);
-            if (pendingSessionId) {
+            if (pendingSessionId && !isMetaRequest) {
               setForeignSessionId(conversationKey, pendingSessionId, {
                 modelId: model,
                 cwd,
@@ -751,7 +751,7 @@ async function handleChatCompletions(
         if (raced.value.done) break;
         const event = raced.value.value;
         const sessionId = extractSessionId(event);
-        if (sessionId) {
+        if (sessionId && !isMetaRequest) {
           setForeignSessionId(conversationKey, sessionId, {
             modelId: model,
             cwd,

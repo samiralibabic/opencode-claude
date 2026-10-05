@@ -38,6 +38,7 @@ export function isTitleGenerationRequest(messages: MessageLike[]): boolean {
 export function isSummaryGenerationRequest(messages: MessageLike[]): boolean {
   const system = metaSystemPrompt(messages).toLowerCase();
   if (
+    system.includes("context summarization agent") ||
     system.includes("anchored context summarization") ||
     system.includes("summarizing, compacting, or merging context") ||
     system.includes("tasked with summarizing conversations") ||

@@ -681,6 +681,13 @@ async function main() {
     /1000 → 100/,
   );
 
+  // Prompt envelopes from OpenCode's packages/core/src/session/compaction.ts.
+  const summarySystemPrompt = "You are a context summarization agent. You are given a conversation between a user and an agent. Your goal is to produce a structured summary matching the format specified so another coding agent can continue the work.";
+  const compactionPrompts = [
+    "Here is the conversation so far:\n\n<conversation>\n[User]: Fix the location field\n</conversation>\n\nCreate a new anchored summary from the conversation history in the <conversation> tags above so another coding agent can continue the work.",
+    "Here is the conversation so far:\n\n<conversation>\n[User]: Proceed\n</conversation>\n\nHere is the summary of the conversation before the <conversation> above:\n\n<prior-summary>\n## Objective\n- Fix the location field\n</prior-summary>\n\nThe <prior-summary> summarizes everything that happened before the <conversation>. Construct a new summary that combines both. The <prior-summary> is discarded after this: anything you do not carry into the new summary is lost.",
+  ];
+
   // Session auto-naming: detect title/summary meta requests.
   {
     const {
@@ -710,6 +717,22 @@ async function main() {
       { role: "user", content: "Please summarize what was done in this conversation." },
     ];
     assert.equal(detectMetaRequestKind(summaryMessages), "summary");
+    assert.equal(
+      detectMetaRequestKind([{ role: "system", content: summarySystemPrompt }]),
+      "summary",
+    );
+    for (const prompt of compactionPrompts) {
+      const user = { role: "user", content: prompt };
+      assert.equal(detectMetaRequestKind([
+        { role: "system", content: summarySystemPrompt }, user,
+      ]), "summary");
+    }
+    assert.equal(detectMetaRequestKind([
+      { role: "system", content: "You are a coding assistant." },
+      { role: "user", content: "Why is <prior-summary> dropped?" },
+      { role: "assistant", content: "Let's check the compaction handler." },
+      { role: "user", content: "Fix it" },
+    ]), null);
 
     const normalMessages = [
       { role: "system", content: "You are a coding assistant." },
@@ -1508,6 +1531,78 @@ async function main() {
         String(seen2.params!.prompt ?? ""),
         /<conversation_history>/,
       );
+
+      // Summarization must not resume or overwrite the ordinary binding.
+      for (const prompt of compactionPrompts) {
+        const seenSummary = { params: null as Record<string, unknown> | null };
+        mockTurn(seenSummary, "mock-sess-summary");
+        const summaryRes = await postChat("smoke-history-resume", [
+          { role: "system", content: summarySystemPrompt },
+          { role: "user", content: prompt },
+        ]);
+        assert.equal(summaryRes.status, 200);
+        await summaryRes.text();
+        assert.equal(seenSummary.params!.resume, undefined);
+        assert.deepEqual(seenSummary.params!.tools, []);
+        assert.equal(seenSummary.params!.maxTurns, 1);
+        assert.equal(seenSummary.params!.permissionMode, "dontAsk");
+        assert.equal(getForeignSessionId("summary:smoke-history-resume"), undefined);
+        assert.equal(getForeignSessionId("smoke-history-resume"), "mock-sess-live");
+      }
+
+      const hooks = await ClaudeCodePlugin({
+        directory: histTmpDir,
+      } as Parameters<typeof ClaudeCodePlugin>[0]);
+      await hooks.event!({ event: {
+        type: "session.idle", properties: { sessionID: "smoke-history-resume" },
+      } });
+      assert.equal(getForeignSessionId("smoke-history-resume"), "mock-sess-live");
+
+      const { putBridge, findBridgeByConversation } = await import("../src/bridge-pool.ts");
+      let closed = false;
+      putBridge({
+        id: "smoke-compaction-bridge",
+        conversationKey: "smoke-history-resume",
+        handle: {
+          stream: (async function* () {})(),
+          interrupt: async () => {},
+          close: () => { closed = true; },
+          getPid: () => null,
+        },
+        pendingTools: new Map(),
+        seenAssistantUsageIds: new Set(),
+        createdAt: Date.now(),
+      });
+      await hooks.event!({ event: {
+        type: "session.compacted", properties: { sessionID: "smoke-history-resume" },
+      } });
+      assert.equal(closed, true);
+      assert.equal(findBridgeByConversation("smoke-history-resume"), undefined);
+      assert.equal(getForeignSessionId("smoke-history-resume"), undefined);
+
+      // Converted OpenCode order: compaction user, summary, retained tail, continue.
+      const compactedMessages = [
+        { role: "system", content: "internal system prompt" },
+        { role: "user", content: "What did we do so far?" },
+        { role: "assistant", content: "## Objective\n- Remember codename AXIOM-9042" },
+        { role: "user", content: "Keep the existing location dropdown styles." },
+        { role: "assistant", content: "The dropdown styles are unchanged." },
+        { role: "user", content: "Proceed" },
+      ];
+      const seenCompacted = { params: null as Record<string, unknown> | null };
+      mockTurn(seenCompacted, "mock-sess-compacted");
+      const compactedRes = await postChat("smoke-history-resume", compactedMessages);
+      assert.equal(compactedRes.status, 200);
+      await compactedRes.text();
+      assert.equal(seenCompacted.params!.resume, undefined);
+      const compactedPrompt = String(seenCompacted.params!.prompt ?? "");
+      assert.match(compactedPrompt, /<conversation_history>/);
+      assert.match(compactedPrompt, /## Objective\n- Remember codename AXIOM-9042/);
+      assert.match(compactedPrompt, /Keep the existing location dropdown styles\./);
+      assert.match(compactedPrompt, /The dropdown styles are unchanged\./);
+      assert.match(compactedPrompt, /Latest user message:\nProceed/);
+      assert.doesNotMatch(compactedPrompt, /remember the codename AXIOM-9042/);
+      assert.equal(getForeignSessionId("smoke-history-resume"), "mock-sess-compacted");
       rmSync(fakeProjectsDir, { recursive: true, force: true });
 
       // 3. Stored binding with a MISSING transcript file → binding dropped,

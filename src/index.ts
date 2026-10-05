@@ -24,6 +24,7 @@ import {
   submitClaudeCliLoginCode,
 } from "./cli-login.js";
 import { log } from "./log.js";
+import { clearForeignSessionId } from "./session-store.js";
 import {
   encodeClaudeModelSelection,
   resolveClaudeModelSelection,
@@ -261,9 +262,23 @@ export const ClaudeCodePlugin: Plugin = async (
         type?: unknown;
         properties?: { sessionID?: unknown };
       };
-      if (busEvent?.type !== "session.idle") return;
+      if (
+        busEvent?.type !== "session.idle" &&
+        busEvent?.type !== "session.compacted"
+      ) return;
       const sessionID = busEvent.properties?.sessionID;
       if (typeof sessionID !== "string" || !sessionID) return;
+      if (busEvent.type === "session.compacted") {
+        // Neither a sticky session nor a parked turn may restore pre-summary history.
+        try {
+          const bridge = findBridgeByConversation(sessionID);
+          if (bridge) deleteBridge(bridge.id);
+          clearForeignSessionId(sessionID);
+        } catch (error) {
+          log.error("[opencode-claude] failed to reset Claude session after compaction", error);
+        }
+        return;
+      }
       for (const key of [sessionID, `title:${sessionID}`]) {
         const bridge = findBridgeByConversation(key);
         if (!bridge) continue;
