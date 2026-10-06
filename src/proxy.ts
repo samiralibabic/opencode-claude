@@ -43,6 +43,7 @@ import {
   setForeignSessionId,
 } from "./session-store.js";
 import { log } from "./log.js";
+import { openCodeContext, openCodeContextPrompt } from "./opencode-context.js";
 import {
   getRateLimitSnapshot,
   maybeRateLimitNote,
@@ -631,6 +632,25 @@ async function handleChatCompletions(
           "This is a single-turn text transformation. Return only the requested summary. Do not inspect files, execute commands, or use tools.",
         ].filter(Boolean).join("\n\n")
     : undefined;
+  const bridgeNote = bridgeOpenCodeTools
+    ? [
+        "You are running inside OpenCode. Built-in Claude Code tools are disabled. Use only the mcp__opencode__* tools provided for this turn; they execute via OpenCode.",
+        "Batch independent tool calls into a single turn instead of calling them one at a time.",
+        ...(hasTodoWrite
+          ? [
+              "For any multi-step work, ALWAYS write the plan with the mcp__opencode__todowrite tool and keep it updated as you progress. A plan that only exists in your text is lost when the session is restored or handed to another agent.",
+            ]
+          : []),
+      ].join(" ")
+    : "";
+  // OpenCode is the only source of instructions: its agent prompt, AGENTS.md
+  // files, skills, MCP notes and plugin additions travel here, and Claude
+  // Code loads no CLAUDE.md, memory or settings of its own.
+  const chatAppend = isMetaRequest
+    ? ""
+    : [bridgeNote, ...openCodeContextPrompt(openCodeContext(messages))]
+        .filter(Boolean)
+        .join("\n\n");
   handle = await queryStarter({
     prompt: queryPrompt,
     cwd,
@@ -645,8 +665,9 @@ async function handleChatCompletions(
     autoCompactEnabled: !isMetaRequest,
     maxTurns: isMetaRequest ? 1 : undefined,
     thinking: isMetaRequest ? { type: "disabled" } : undefined,
-    settingSources: isMetaRequest ? [] : undefined,
-    skills: isMetaRequest ? [] : undefined,
+    settingSources: [],
+    skills: [],
+    disableAutoMemory: true,
     // Only OpenCode's tools, run through OpenCode's permissions. A turn that
     // arrives without them gets no tools at all, never auto-approved
     // built-ins, and none of the user's own Claude Code MCP servers,
@@ -662,19 +683,7 @@ async function handleChatCompletions(
     systemPrompt: utilitySystemPrompt || {
       type: "preset",
       preset: "claude_code",
-      ...(bridgeOpenCodeTools
-        ? {
-            append: [
-              "You are running inside OpenCode. Built-in Claude Code tools are disabled. Use only the mcp__opencode__* tools provided for this turn; they execute via OpenCode.",
-              "Batch independent tool calls into a single turn instead of calling them one at a time.",
-              ...(hasTodoWrite
-                ? [
-                    "For any multi-step work, ALWAYS write the plan with the mcp__opencode__todowrite tool and keep it updated as you progress. A plan that only exists in your text is lost when the session is restored or handed to another agent.",
-                  ]
-                : []),
-            ].join(" "),
-          }
-        : {}),
+      ...(chatAppend ? { append: chatAppend } : {}),
     },
   });
 

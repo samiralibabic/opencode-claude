@@ -219,6 +219,128 @@ async function isolation(ctx: Ctx) {
   assert.deepEqual(seen!.tools, []);
 }
 
+/** System messages shaped like OpenCode 1.18's (session/llm/request.ts). */
+function openCodeSystem(head: string) {
+  const env = [
+    "You are powered by the model named claude-opus-5-5[1m]. The exact model ID is claude-code/claude-opus-5-5[1m]",
+    "Here is some useful information about the environment you are running in:",
+    "<env>",
+    "  Working directory: /work/app",
+    "  Workspace root folder: /work/app",
+    "  Is directory a git repo: yes",
+    "  Platform: darwin",
+    // temporal-context rewrites OpenCode's "Today's date:" line in place.
+    "  Current date: 2026-10-06 (Tuesday; timezone: Europe/Berlin)",
+    "</env>",
+  ].join("\n");
+  const first = [
+    head,
+    env,
+    "Instructions from: /home/u/.config/opencode/AGENTS.md\n# Decision ownership\nAsk before choosing GLOBAL-RULE-7.",
+    "Instructions from: /work/app/AGENTS.md\nPROJECT-RULE-3: run make check.",
+    "Skills provide specialized instructions and workflows for specific tasks.\nUse the skill tool to load a skill when a task matches its description.\n<available_skills>\n  <skill><name>wrangler</name></skill>\n</available_skills>",
+    "<mcp_instructions>\n  <server name=\"pencil\">\n    Use pencil for .pen files.\n  </server>\n</mcp_instructions>",
+  ].join("\n");
+  return [
+    { role: "system", content: first },
+    {
+      role: "system",
+      content: "## Session-scoped durable task state\n\nThis OpenCode session's durable state path is `.agent/sessions/ses_1/task.md`.",
+    },
+    {
+      role: "system",
+      content: "<temporal_metadata>\nConversation history may contain <conversation_date/> markers.\n</temporal_metadata>",
+    },
+  ];
+}
+
+const STOCK_HEAD =
+  "You are OpenCode, the best coding agent on the planet.\n\nYou are an interactive CLI tool that helps users with software engineering tasks.";
+
+async function systemContext(ctx: Ctx) {
+  const { openCodeContext } = await import("../src/opencode-context.ts");
+
+  // Built-in agent: stock prompt and stock env lines dropped, the rest kept.
+  const built = openCodeContext(openCodeSystem(STOCK_HEAD));
+  assert.equal(built.agentPrompt, "");
+  const text = built.blocks.join("\n\n");
+  for (const kept of [
+    "Current date: 2026-10-06 (Tuesday; timezone: Europe/Berlin)",
+    "Instructions from: /home/u/.config/opencode/AGENTS.md",
+    "GLOBAL-RULE-7",
+    "PROJECT-RULE-3",
+    "<available_skills>",
+    "<mcp_instructions>",
+    "durable state path is `.agent/sessions/ses_1/task.md`",
+    "<temporal_metadata>",
+  ]) {
+    assert.ok(text.includes(kept), `forwarded: ${kept}`);
+  }
+  for (const dropped of [
+    "best coding agent on the planet",
+    "You are powered by the model named",
+    "Working directory:",
+    "Platform: darwin",
+    "<env>",
+  ]) {
+    assert.ok(!text.includes(dropped), `not forwarded: ${dropped}`);
+  }
+
+  // Custom agent: its own prompt becomes the agent role.
+  const custom = openCodeContext(
+    openCodeSystem("Independently review the assigned work. Return SCOPE REQUIRED when unclear."),
+  );
+  assert.match(custom.agentPrompt, /^Independently review the assigned work/);
+
+  // Unknown layout: forwarded whole rather than lost.
+  const odd = openCodeContext([{ role: "system", content: "Some other layout. KEEP-ME." }]);
+  assert.deepEqual(odd.blocks, ["Some other layout. KEEP-ME."]);
+
+  // End to end: chat turns get only OpenCode's context, nothing from disk.
+  const { post, proxy } = ctx;
+  let seen: Record<string, any> | null = null;
+  proxy.setClaudeQueryStarter(async (params) => {
+    seen = params as Record<string, any>;
+    return textTurn("ok", "ctx-sess");
+  });
+  await (await post("ctx-chat", {
+    tools: [bashTool],
+    messages: [...openCodeSystem(STOCK_HEAD), { role: "user", content: "hi" }],
+  })).json();
+  assert.deepEqual(seen!.settingSources, [], "no CLAUDE.md, settings or plugins from disk");
+  assert.deepEqual(seen!.skills, []);
+  assert.equal(seen!.disableAutoMemory, true);
+  const append = String(seen!.systemPrompt.append);
+  assert.match(append, /mcp__opencode__\* tools/);
+  assert.match(append, /# OpenCode context/);
+  assert.match(append, /GLOBAL-RULE-7/);
+  assert.match(append, /durable state path/);
+  assert.match(append, /<temporal_metadata>/);
+  assert.doesNotMatch(append, /# Agent role/);
+  assert.doesNotMatch(append, /best coding agent on the planet/);
+
+  seen = null;
+  await (await post("ctx-sub", {
+    tools: [bashTool],
+    messages: [
+      ...openCodeSystem("Investigate the assigned question. EXPLORE-ROLE."),
+      { role: "user", content: "hi" },
+    ],
+  })).json();
+  assert.match(String(seen!.systemPrompt.append), /# Agent role[\s\S]*EXPLORE-ROLE/);
+
+  // Meta turns keep their own one-purpose prompt.
+  seen = null;
+  await (await post("ctx-title", {
+    messages: [
+      { role: "system", content: "You are a title generator. Output only the title." },
+      { role: "user", content: "hi" },
+    ],
+  })).json();
+  assert.equal(typeof seen!.systemPrompt, "string");
+  assert.equal(seen!.disableAutoMemory, true);
+}
+
 async function queryOptions() {
   const { startClaudeQuery } = await import("../src/query.ts");
   const capture = async (params: Record<string, unknown>) => {
@@ -262,6 +384,7 @@ async function main() {
     await steering(ctx);
     await queuedTurnStart(ctx);
     await isolation(ctx);
+    await systemContext(ctx);
     await queryOptions();
   } finally {
     ctx.proxy.setClaudeQueryStarter(null);
