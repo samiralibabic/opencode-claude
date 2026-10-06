@@ -353,11 +353,36 @@ function selectionFromRequest(
   return { modelId, ...(effort ? { effort } : {}) };
 }
 
+/**
+ * Outline of an OpenCode request for the debug log: the role sequence and
+ * how each system message starts. Lets the bridge contract be checked
+ * against real traffic without logging conversation content.
+ */
+function requestShape(messages: OpenAIMessage[]): {
+  roles: string;
+  systemHeads: string[];
+} {
+  const runs: Array<[string, number]> = [];
+  for (const msg of messages) {
+    const role = msg.role || "?";
+    const last = runs.at(-1);
+    if (last && last[0] === role) last[1]++;
+    else runs.push([role, 1]);
+  }
+  return {
+    roles: runs.map(([role, n]) => (n > 1 ? `${role}x${n}` : role)).join(" "),
+    systemHeads: messages
+      .filter((m) => m.role === "system")
+      .map((m) => extractTextContent(m.content).slice(0, 80)),
+  };
+}
+
 async function handleChatCompletions(
   req: Request,
   body: ChatCompletionRequest,
 ): Promise<Response> {
   const messages = Array.isArray(body.messages) ? body.messages : [];
+  log.info("[opencode-claude] request shape", requestShape(messages));
   const metaKind = detectMetaRequestKind(messages);
   const sessionHeader = req.headers.get(SESSION_HEADER);
   const conversationKey =
@@ -835,6 +860,46 @@ function extractSessionId(event: unknown): string | null {
   return null;
 }
 
+/** Claude Code truncates MCP tool descriptions at this many characters. */
+export const CLAUDE_TOOL_DESCRIPTION_LIMIT = 2048;
+
+/**
+ * Heading OpenCode 1.x puts before the subagent list it appends to the END
+ * of the task tool description (tool/registry.ts describeTask).
+ */
+const AGENT_LIST_MARKER = "Available agent types and the tools they have access to:";
+
+/**
+ * OpenCode's task description is longer than Claude Code's cut, so the
+ * appended subagent list never reached Claude and it didn't know which
+ * agents exist. Move the list to the front: the cut then lands on the tail
+ * of the generic guidance instead. Nothing is dropped here. (From upstream
+ * 1.1.0.)
+ */
+export function fitToolDescription(description: string): string {
+  if (description.length <= CLAUDE_TOOL_DESCRIPTION_LIMIT) return description;
+  const at = description.indexOf(AGENT_LIST_MARKER);
+  if (at <= 0) return description;
+  const agents = description.slice(at).trim();
+  const guidance = description.slice(0, at).trim();
+  return guidance ? `${agents}\n\n${guidance}` : agents;
+}
+
+/** OpenCode tool parameters as an MCP-valid object schema. */
+export function normalizeToolParameters(
+  parameters: unknown,
+): Record<string, unknown> {
+  if (
+    parameters &&
+    typeof parameters === "object" &&
+    !Array.isArray(parameters) &&
+    (parameters as { type?: unknown }).type === "object"
+  ) {
+    return parameters as Record<string, unknown>;
+  }
+  return { type: "object", properties: {} };
+}
+
 async function buildOpenCodeMcpServer(
   tools: OpenAITool[],
   pendingTools: Map<string, ParkedToolCall>,
@@ -886,14 +951,38 @@ async function buildOpenCodeMcpServer(
       return shape;
     };
 
+    // What Claude is shown: OpenCode's descriptions and JSON schemas verbatim
+    // (parameter descriptions, enums, nested fields). The zod conversion
+    // below only validates arguments; it is never what Claude reads.
+    const listed: Array<{
+      name: string;
+      description: string;
+      inputSchema: Record<string, unknown>;
+      _meta: Record<string, unknown>;
+    }> = [];
     const mcpTools = tools
       .map((t) => {
         const name = t.function?.name;
         if (!name) return null;
-        const description = t.function?.description || name;
-        const shape = jsonSchemaToZodShape(
-          t.function?.parameters as Record<string, unknown> | undefined,
-        );
+        const description = fitToolDescription(t.function?.description || name);
+        const params = normalizeToolParameters(t.function?.parameters);
+        listed.push({
+          name,
+          description,
+          inputSchema: params,
+          _meta: { "anthropic/alwaysLoad": true },
+        });
+        let shape: unknown;
+        try {
+          // Loose: unknown arguments reach OpenCode instead of being dropped.
+          shape = (z as unknown as {
+            fromJSONSchema: (s: unknown) => { loose: () => unknown };
+          })
+            .fromJSONSchema(params)
+            .loose();
+        } catch {
+          shape = jsonSchemaToZodShape(params);
+        }
         return toolFactory(
           name,
           description,
@@ -930,7 +1019,17 @@ async function buildOpenCodeMcpServer(
       name: "opencode",
       alwaysLoad: true,
       tools: mcpTools,
-    });
+    }) as { instance?: { server?: { setRequestHandler?: Function } } };
+
+    const mcpServer = server.instance?.server;
+    if (typeof mcpServer?.setRequestHandler === "function") {
+      mcpServer.setRequestHandler(
+        z.object({ method: z.literal("tools/list"), params: z.any().optional() }),
+        async () => ({ tools: listed }),
+      );
+    } else {
+      log.warn("[opencode-claude] MCP tools/list override unavailable; tool schemas are converted");
+    }
 
     return { opencode: server };
   } catch (err) {

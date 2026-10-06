@@ -341,6 +341,83 @@ async function systemContext(ctx: Ctx) {
   assert.equal(seen!.disableAutoMemory, true);
 }
 
+async function toolSurface(ctx: Ctx) {
+  const { fitToolDescription, CLAUDE_TOOL_DESCRIPTION_LIMIT } = await import(
+    "../src/proxy.ts"
+  );
+  // OpenCode 1.18: task.txt (2305 chars) + the subagent list appended last.
+  const guidance = "Launch a new agent to handle complex tasks. ".repeat(53);
+  const list =
+    "Available agent types and the tools they have access to:\n- explore: Read-only research.\n- implement: Implement bounded changes.\n- review: Independent review.";
+  const fitted = fitToolDescription(`${guidance}\n${list}`);
+  assert.ok(guidance.length > CLAUDE_TOOL_DESCRIPTION_LIMIT);
+  assert.ok(
+    fitted.slice(0, CLAUDE_TOOL_DESCRIPTION_LIMIT).includes("- review: Independent review."),
+    "subagent list survives Claude Code's description cut",
+  );
+  assert.ok(fitted.includes(guidance.trim()), "nothing dropped");
+  assert.equal(fitToolDescription("short"), "short");
+
+  const questionTool = {
+    type: "function",
+    function: {
+      name: "question",
+      description: "Ask the user questions.",
+      parameters: {
+        type: "object",
+        properties: {
+          questions: {
+            type: "array",
+            description: "Questions to ask",
+            items: {
+              type: "object",
+              properties: {
+                question: { type: "string", description: "The question" },
+                mode: { type: "string", enum: ["single", "multiple"] },
+              },
+              required: ["question"],
+            },
+          },
+        },
+        required: ["questions"],
+      },
+    },
+  };
+  const { post, proxy } = ctx;
+  let listedTools: any[] = [];
+  let toolArgs: Record<string, unknown> | null = null;
+  const { callTool, listTools } = await import("./helpers.ts");
+  proxy.setClaudeQueryStarter(async (params) =>
+    mockHandle(
+      (async function* () {
+        yield { type: "system", subtype: "init", session_id: "tools-sess" };
+        listedTools = await listTools(params);
+        toolArgs = { questions: [{ question: "Ship it?", mode: "single" }], extra: true };
+        await callTool(params, "question", toolArgs);
+        yield { type: "user", message: { role: "user", content: [] } };
+        yield textDelta("DONE");
+        yield { type: "result", is_error: false, usage: {} };
+      })(),
+    ),
+  );
+  const parked = (await (await post("tools-schema", {
+    tools: [questionTool],
+    messages: [{ role: "user", content: "ask me" }],
+  })).json()) as any;
+  const listed = listedTools.find((t) => t.name === "question");
+  assert.deepEqual(listed.inputSchema, questionTool.function.parameters, "schema verbatim");
+  const call = parked.choices[0].message.tool_calls[0];
+  assert.deepEqual(JSON.parse(call.function.arguments), toolArgs, "arguments intact");
+  await (await post("tools-schema", {
+    tools: [questionTool],
+    messages: [
+      { role: "user", content: "ask me" },
+      { role: "assistant", content: null, tool_calls: [call] },
+      { role: "tool", tool_call_id: call.id, content: "yes" },
+    ],
+  })).json();
+}
+
 async function queryOptions() {
   const { startClaudeQuery } = await import("../src/query.ts");
   const capture = async (params: Record<string, unknown>) => {
@@ -385,6 +462,7 @@ async function main() {
     await queuedTurnStart(ctx);
     await isolation(ctx);
     await systemContext(ctx);
+    await toolSurface(ctx);
     await queryOptions();
   } finally {
     ctx.proxy.setClaudeQueryStarter(null);
