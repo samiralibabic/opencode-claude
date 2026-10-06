@@ -4,6 +4,15 @@
 import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
 import { EventEmitter } from "node:events";
+import { mkdtempSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+
+// Never touch the live plugin's data (sessions.json, rate-limit.json,
+// debug.log) or inherit the host's behaviour switches.
+process.env.XDG_DATA_HOME = mkdtempSync(join(tmpdir(), "opencode-claude-smoke-"));
+delete process.env.OPENCODE_CLAUDE_RATE_LIMIT_FAST_FAIL;
+delete process.env.OPENCODE_CLAUDE_DEBUG;
 
 async function main() {
   const { buildClaudeCodeChildEnv } = await import("../src/auth-env.ts");
@@ -746,8 +755,7 @@ async function main() {
     const { spawnSync } = await import("node:child_process");
     const { readFileSync, unlinkSync, existsSync } = await import("node:fs");
     const { join } = await import("node:path");
-    const { homedir } = await import("node:os");
-    const logPath = join(homedir(), ".local", "share", "opencode-claude", "debug.log");
+    const logPath = join(process.env.XDG_DATA_HOME!, "opencode-claude", "debug.log");
     if (existsSync(logPath)) unlinkSync(logPath);
 
     const off = spawnSync(
