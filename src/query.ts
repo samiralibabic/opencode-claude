@@ -197,6 +197,13 @@ export type StartClaudeQueryParams = {
   disallowedTools?: string[];
   skills?: string[] | "all";
   settingSources?: Array<"user" | "project" | "local">;
+  /**
+   * Attach only the MCP servers passed in `mcpServers`: no ~/.claude.json or
+   * project .mcp.json servers, no claude.ai connectors.
+   */
+  isolateMcp?: boolean;
+  /** Claude Code's auto-memory neither read nor written for this query. */
+  disableAutoMemory?: boolean;
   pathToClaudeCodeExecutable?: string;
   /** Required when permissionMode is bypassPermissions. */
   allowDangerouslySkipPermissions?: boolean;
@@ -232,6 +239,7 @@ export async function startClaudeQuery(
   }
 
   const env = buildClaudeCodeChildEnv(params.env || process.env);
+  if (params.disableAutoMemory === true) env.CLAUDE_CODE_DISABLE_AUTO_MEMORY = "1";
   const cwd = assertClaudeWorkingDirectory(params.cwd);
   const pathToClaudeCodeExecutable =
     trimmedString(params.pathToClaudeCodeExecutable) ||
@@ -281,6 +289,14 @@ export async function startClaudeQuery(
   if (params.autoCompactEnabled !== false) {
     options.autoCompactEnabled = true;
   }
+
+  const settings: Record<string, unknown> = {};
+  if (params.isolateMcp === true) {
+    options.strictMcpConfig = true;
+    settings.disableClaudeAiConnectors = true;
+  }
+  if (params.disableAutoMemory === true) settings.autoMemoryEnabled = false;
+  if (Object.keys(settings).length > 0) options.settings = settings;
 
   if (Number.isInteger(params.maxTurns) && Number(params.maxTurns) > 0) {
     options.maxTurns = params.maxTurns;
@@ -350,6 +366,7 @@ export async function startClaudeQuery(
     effort: options.effort,
     resume: Boolean(resume),
     cwd,
+    cli: pathToClaudeCodeExecutable,
   });
 
   // Hand the SDK transport its own abort signal. The query handle does not

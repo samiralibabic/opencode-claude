@@ -1,10 +1,40 @@
 /**
  * Resolve the `claude` CLI binary (from OpenChamber harness executable-path).
  */
-import { spawnSync } from "node:child_process";
+import { execFile, spawnSync } from "node:child_process";
 import { homedir } from "node:os";
 import { join } from "node:path";
 import { buildClaudeCodeChildEnv } from "./auth-env.js";
+import { log } from "./log.js";
+
+/** Pins the CLI the plugin runs instead of resolving `claude` from PATH. */
+export const CLI_PATH_ENV = "OPENCODE_CLAUDE_CLI_PATH";
+
+const loggedCliVersions = new Set<string>();
+
+/**
+ * Record once per process which CLI build serves the turns: the default
+ * install updates itself, so its behaviour can change under the plugin.
+ * Async, so the probe never blocks the host's event loop.
+ */
+function logCliVersionOnce(
+  path: string,
+  env: NodeJS.ProcessEnv | Record<string, string | undefined>,
+): void {
+  if (loggedCliVersions.has(path)) return;
+  loggedCliVersions.add(path);
+  execFile(
+    path,
+    ["--version"],
+    { timeout: 4000, env: buildClaudeCodeChildEnv(env) as NodeJS.ProcessEnv },
+    (error, stdout) => {
+      log.info("[opencode-claude] Claude Code CLI", {
+        path,
+        version: error ? null : `${stdout}`.trim() || null,
+      });
+    },
+  );
+}
 
 function probeClaude(
   candidate: string,
@@ -90,6 +120,11 @@ let cachedResolution: { key: string; path: string | null } | null = null;
 export function resolveClaudeCli(
   env: NodeJS.ProcessEnv | Record<string, string | undefined> = process.env,
 ): string | null {
+  const pinned = env[CLI_PATH_ENV]?.trim();
+  if (pinned) {
+    logCliVersionOnce(pinned, env);
+    return pinned;
+  }
   const key = `${env.PATH ?? ""}${env.HOME ?? ""}`;
   if (cachedResolution && cachedResolution.key === key) {
     return cachedResolution.path;
@@ -101,7 +136,10 @@ export function resolveClaudeCli(
     null;
   // Only positive hits are memoized — a CLI installed mid-process (the
   // one-click install action) must be found on the next detect.
-  if (resolved) cachedResolution = { key, path: resolved };
+  if (resolved) {
+    cachedResolution = { key, path: resolved };
+    logCliVersionOnce(resolved, env);
+  }
   return resolved;
 }
 

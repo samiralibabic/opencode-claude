@@ -615,25 +615,18 @@ async function handleChatCompletions(
     thinking: isMetaRequest ? { type: "disabled" } : undefined,
     settingSources: isMetaRequest ? [] : undefined,
     skills: isMetaRequest ? [] : undefined,
-    tools: isMetaRequest || bridgeOpenCodeTools ? [] : undefined,
+    // Only OpenCode's tools, run through OpenCode's permissions. A turn that
+    // arrives without them gets no tools at all, never auto-approved
+    // built-ins, and none of the user's own Claude Code MCP servers,
+    // claude.ai connectors or plugin tools.
+    tools: [],
+    isolateMcp: true,
     toolAliases,
     allowedTools: bridgeOpenCodeTools
       ? openCodeToolNames.map((n) => `mcp__opencode__${n}`)
       : undefined,
-    permissionMode: isMetaRequest
-      ? "dontAsk"
-      : bridgeOpenCodeTools
-      ? "bypassPermissions"
-      : "acceptEdits",
+    permissionMode: bridgeOpenCodeTools ? "bypassPermissions" : "dontAsk",
     allowDangerouslySkipPermissions: bridgeOpenCodeTools,
-    ...(bridgeOpenCodeTools
-      ? {}
-      : {
-          canUseTool: async (
-            _toolName: string,
-            input: Record<string, unknown>,
-          ) => ({ behavior: "allow" as const, updatedInput: input }),
-        }),
     systemPrompt: utilitySystemPrompt || {
       type: "preset",
       preset: "claude_code",
