@@ -1579,6 +1579,7 @@ async function main() {
         },
         pendingTools: new Map(),
         seenAssistantUsageIds: new Set(),
+        forwardedSteering: new Set(),
         createdAt: Date.now(),
       });
       await hooks.event!({ event: {

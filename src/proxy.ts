@@ -54,11 +54,14 @@ import {
 } from "./rate-limit.js";
 import {
   buildConversationTranscript,
+  collectSteeringMessages,
   extractTextContent,
   latestUserPrompt,
   priorMessagesOf,
   promptAsStream,
   withConversationContext,
+  withSteering,
+  type McpToolResultContent,
   type SdkUserPrompt,
 } from "./prompt.js";
 import {
@@ -325,11 +328,13 @@ async function handleRequest(req: Request): Promise<Response> {
 
 function collectToolResults(
   messages: OpenAIMessage[],
-): Map<string, string> {
-  const results = new Map<string, string>();
+): Map<string, McpToolResultContent[]> {
+  const results = new Map<string, McpToolResultContent[]>();
   for (const msg of messages) {
     if (msg.role !== "tool" || !msg.tool_call_id) continue;
-    results.set(msg.tool_call_id, extractTextContent(msg.content));
+    results.set(msg.tool_call_id, [
+      { type: "text", text: extractTextContent(msg.content) },
+    ]);
   }
   return results;
 }
@@ -376,13 +381,40 @@ async function handleChatCompletions(
   }
   if (existing && existing.pendingTools.size > 0) {
     let resolved = 0;
+    // User messages sent while the tool ran ride the last tool result
+    // resolved now. Results of one park can arrive over several resume
+    // requests that all still carry the same queued messages after a tool
+    // result, so the bridge remembers what it forwarded: each reaches Claude
+    // exactly once.
+    const freshSteering = collectSteeringMessages(messages)
+      .map((m) => ({
+        key: createHash("sha1").update(m.key).digest("hex"),
+        text: m.text,
+      }))
+      .filter((m) => !existing!.forwardedSteering.has(m.key));
+    const resolvable = [...existing.pendingTools.keys()].filter((id) =>
+      toolResults.has(id),
+    );
+    const steeringToolId =
+      freshSteering.length > 0 ? resolvable.at(-1) : undefined;
     for (const [toolId, tool] of existing.pendingTools) {
       const result = toolResults.get(toolId);
       if (result !== undefined) {
-        tool.resolve(result);
+        tool.resolve(
+          toolId === steeringToolId
+            ? withSteering(result, freshSteering.map((m) => m.text))
+            : result,
+        );
         existing.pendingTools.delete(toolId);
         resolved++;
       }
+    }
+    if (steeringToolId) {
+      for (const m of freshSteering) existing.forwardedSteering.add(m.key);
+      log.info("[opencode-claude] forwarding mid-turn user messages", {
+        conversationKey: existing.conversationKey,
+        messages: freshSteering.length,
+      });
     }
     if (existing.pendingTools.size === 0 && existing.continueStream) {
       log.info("[opencode-claude] resuming parked bridge", {
@@ -652,6 +684,7 @@ async function handleChatCompletions(
     handle,
     pendingTools,
     seenAssistantUsageIds: new Set(),
+    forwardedSteering: new Set(),
     createdAt: Date.now(),
   };
   putBridge(bridge);
@@ -865,16 +898,18 @@ async function buildOpenCodeMcpServer(
               resolve: () => {},
               reject: () => {},
             };
-            const resultPromise = new Promise<string>((resolve, reject) => {
-              pending.resolve = resolve;
-              pending.reject = reject;
-            });
+            const resultPromise = new Promise<McpToolResultContent[]>(
+              (resolve, reject) => {
+                pending.resolve = resolve;
+                pending.reject = reject;
+              },
+            );
             // Register before notifying so the stream consumer sees the tool.
             pendingTools.set(id, pending);
             onPark();
             const result = await resultPromise;
             return {
-              content: [{ type: "text", text: result }],
+              content: result.length > 0 ? result : [{ type: "text", text: "" }],
             };
           },
           { alwaysLoad: true },
