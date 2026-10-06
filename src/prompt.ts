@@ -489,10 +489,45 @@ export function latestUserPrompt(
 }
 
 /** Content of an MCP tool result handed back to Claude. */
-export type McpToolResultContent = { type: "text"; text: string };
+export type McpToolResultContent =
+  | { type: "text"; text: string }
+  | { type: "image"; data: string; mimeType: string };
 
-const STEERING_ATTACHMENT_NOTE =
-  "[The user attached a file or image here that could not be relayed mid-turn.]";
+/**
+ * Attachments as they can reach a turn that is already running. Claude Code
+ * shows a base64 image inside an MCP tool result as a real image. Documents
+ * (PDFs) it only saves to disk and names by path, and URL-sourced media
+ * cannot ride an MCP result at all; those are `deferred` and travel in a
+ * follow-up user message once the turn ends (see `followUpPrompt`), where
+ * Claude reads them natively.
+ */
+export function mediaForRunningTurn(content: unknown): {
+  images: McpToolResultContent[];
+  deferred: AnthropicContentBlock[];
+} {
+  const images: McpToolResultContent[] = [];
+  const deferred: AnthropicContentBlock[] = [];
+  for (const block of openaiContentToAnthropicBlocks(content)) {
+    if (block.type === "text") continue;
+    if (block.type === "image" && block.source.type === "base64") {
+      images.push({
+        type: "image",
+        data: block.source.data,
+        mimeType: block.source.media_type,
+      });
+    } else {
+      deferred.push(block);
+    }
+  }
+  return { images, deferred };
+}
+
+export type SteeringMessage = {
+  key: string;
+  text: string;
+  images: McpToolResultContent[];
+  deferred: AnthropicContentBlock[];
+};
 
 /**
  * Steering: user messages OpenCode queued while a bridged tool was running
@@ -503,17 +538,17 @@ const STEERING_ATTACHMENT_NOTE =
  * it across resume requests: its content plus how many earlier user
  * messages carry the same content. A raw index would not do, because tool
  * results of a split park get inserted before the queued message in later
- * requests. (Ported from upstream 1.1.0, text only.)
+ * requests. (Ported from upstream 1.1.0.)
  */
 export function collectSteeringMessages(
   messages: Array<{ role?: string; content?: unknown }>,
-): Array<{ key: string; text: string }> {
+): SteeringMessage[] {
   let lastTool = -1;
   for (let i = 0; i < messages.length; i++) {
     if (messages[i]?.role === "tool") lastTool = i;
   }
   if (lastTool < 0) return [];
-  const out: Array<{ key: string; text: string }> = [];
+  const out: SteeringMessage[] = [];
   const occurrences = new Map<string, number>();
   for (let i = 0; i < messages.length; i++) {
     const msg = messages[i];
@@ -522,23 +557,28 @@ export function collectSteeringMessages(
     const nth = occurrences.get(identity) ?? 0;
     occurrences.set(identity, nth + 1);
     if (i <= lastTool) continue;
-    const text = [
-      extractTextContent(msg.content).trim(),
-      contentHasAttachments(msg.content) ? STEERING_ATTACHMENT_NOTE : "",
-    ]
-      .filter(Boolean)
-      .join("\n");
-    if (text) out.push({ key: `${nth}:${identity}`, text });
+    const text = extractTextContent(msg.content).trim();
+    const { images, deferred } = mediaForRunningTurn(msg.content);
+    if (text || images.length > 0 || deferred.length > 0) {
+      out.push({ key: `${nth}:${identity}`, text, images, deferred });
+    }
   }
   return out;
 }
 
-/** Append steering to a tool result so Claude reads it on resume. */
+/**
+ * Append steering to a tool result so Claude reads it on resume: the texts
+ * in a reminder, images right after it, and a note for attachments that
+ * follow once the turn ends.
+ */
 export function withSteering(
   result: McpToolResultContent[],
-  steering: string[],
+  steering: SteeringMessage[],
 ): McpToolResultContent[] {
   if (steering.length === 0) return result;
+  const texts = steering.map((m) => m.text).filter(Boolean);
+  const images = steering.flatMap((m) => m.images);
+  const deferred = steering.reduce((n, m) => n + m.deferred.length, 0);
   return [
     ...result,
     {
@@ -547,11 +587,80 @@ export function withSteering(
         "<system-reminder>",
         "While this tool was running, the user sent the following message(s). Read them now and adjust your current work accordingly; they take priority over earlier instructions where they conflict:",
         "",
-        steering.join("\n\n"),
+        texts.length > 0 ? texts.join("\n\n") : "(attachments only)",
+        ...(images.length > 0
+          ? ["", `The user attached ${images.length} image(s), shown below.`]
+          : []),
+        ...(deferred > 0 ? ["", followUpNote(deferred, "the user attached")] : []),
         "</system-reminder>",
       ].join("\n"),
     },
+    ...images,
   ];
+}
+
+/** Tells Claude that attachments are waiting for the end of its turn. */
+export function followUpNote(count: number, origin: string): string {
+  return `[${origin} ${count} document(s) or file(s) that cannot be shown inside a tool result. OpenCode attaches them to a follow-up message as soon as you end this turn; to read them, end your turn now without calling more tools.]`;
+}
+
+/** The follow-up message that delivers deferred attachments. */
+export function followUpPrompt(blocks: AnthropicContentBlock[]): SdkUserPrompt {
+  return {
+    type: "user",
+    message: {
+      role: "user",
+      content: [
+        {
+          type: "text",
+          text: "<system-reminder>\nThese are the attachments announced during your last turn, which could not be shown inside a tool result. Read them and continue the task.\n</system-reminder>",
+        },
+        ...blocks,
+      ],
+    },
+    parent_tool_use_id: null,
+  };
+}
+
+/**
+ * A prompt stream that stays open for the life of a turn, so the bridge can
+ * send a follow-up message (deferred attachments) after Claude's result in
+ * the same Claude Code process. Ending it lets the SDK close the CLI's
+ * stdin, as a one-shot prompt stream would.
+ */
+export function createPromptChannel(initial: string | SdkUserPrompt): {
+  iterable: AsyncIterable<SdkUserPrompt>;
+  push: (message: SdkUserPrompt) => void;
+  end: () => void;
+} {
+  const queue: SdkUserPrompt[] = [];
+  let ended = false;
+  let wake: (() => void) | null = null;
+  const notify = () => {
+    const resolve = wake;
+    wake = null;
+    resolve?.();
+  };
+  async function* iterate(): AsyncGenerator<SdkUserPrompt, void, unknown> {
+    yield* promptAsStream(initial);
+    while (true) {
+      while (queue.length > 0) yield queue.shift()!;
+      if (ended) return;
+      await new Promise<void>((resolve) => (wake = resolve));
+    }
+  }
+  return {
+    iterable: iterate(),
+    push(message) {
+      if (ended) return;
+      queue.push(message);
+      notify();
+    },
+    end() {
+      ended = true;
+      notify();
+    },
+  };
 }
 
 export async function* promptAsStream(

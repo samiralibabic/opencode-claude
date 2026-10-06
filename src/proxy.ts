@@ -56,12 +56,18 @@ import {
 import {
   buildConversationTranscript,
   collectSteeringMessages,
+  createPromptChannel,
   extractTextContent,
+  followUpNote,
+  followUpPrompt,
+  isSyntheticToolMediaMessage,
   latestUserPrompt,
+  mediaForRunningTurn,
   priorMessagesOf,
   promptAsStream,
   withConversationContext,
   withSteering,
+  type AnthropicContentBlock,
   type McpToolResultContent,
   type SdkUserPrompt,
 } from "./prompt.js";
@@ -335,9 +341,87 @@ function collectToolResults(
     if (msg.role !== "tool" || !msg.tool_call_id) continue;
     results.set(msg.tool_call_id, [
       { type: "text", text: extractTextContent(msg.content) },
+      ...mediaForRunningTurn(msg.content).images,
     ]);
   }
   return results;
+}
+
+function mediaKey(block: AnthropicContentBlock | McpToolResultContent): string {
+  const raw =
+    block.type === "text"
+      ? block.text
+      : "data" in block
+        ? block.data
+        : block.source.type === "base64"
+          ? block.source.data
+          : block.source.url;
+  return createHash("sha1").update(`${block.type}:${raw}`).digest("hex");
+}
+
+/**
+ * OpenCode 1.x moves the images and PDFs a step's tools returned (read on a
+ * PNG or PDF, screenshots) into one synthetic user message after the tool
+ * results ("Attached media from tool result:"), because openai-compatible
+ * tool results carry text only. It doesn't say which call produced which
+ * file, so the media goes with the last of the step's calls answered now.
+ * Images ride that tool result; documents and URL media are returned for a
+ * follow-up message, with a note in the result. Media already handed over
+ * by an earlier resume request of the same step is skipped. (Images: from
+ * upstream 1.1.0; the follow-up is local.)
+ */
+function attachPromotedToolMedia(
+  messages: OpenAIMessage[],
+  toolResults: Map<string, McpToolResultContent[]>,
+  bridge: ParkedBridge,
+): AnthropicContentBlock[] {
+  let lastAssistant = -1;
+  for (let i = messages.length - 1; i >= 0; i--) {
+    if (messages[i]?.role === "assistant") {
+      lastAssistant = i;
+      break;
+    }
+  }
+  const step = messages.slice(lastAssistant + 1);
+  const stepToolIds = step
+    .filter((msg) => msg.role === "tool" && msg.tool_call_id)
+    .map((msg) => msg.tool_call_id!);
+  const target = stepToolIds.filter((id) => bridge.pendingTools.has(id)).at(-1);
+  if (!target) return [];
+  const images: McpToolResultContent[] = [];
+  const deferred: AnthropicContentBlock[] = [];
+  for (const msg of step) {
+    if (!isSyntheticToolMediaMessage(msg)) continue;
+    const media = mediaForRunningTurn(msg.content);
+    for (const image of media.images) {
+      const key = mediaKey(image);
+      if (bridge.forwardedMedia.has(key)) continue;
+      bridge.forwardedMedia.add(key);
+      images.push(image);
+    }
+    for (const block of media.deferred) {
+      const key = mediaKey(block);
+      if (bridge.forwardedMedia.has(key)) continue;
+      bridge.forwardedMedia.add(key);
+      deferred.push(block);
+    }
+  }
+  if (images.length === 0 && deferred.length === 0) return [];
+  const result = toolResults.get(target)!;
+  if (stepToolIds.length > 1) {
+    result.push({
+      type: "text",
+      text: "Media attached to the tool results of this step:",
+    });
+  }
+  result.push(...images);
+  if (deferred.length > 0) {
+    result.push({
+      type: "text",
+      text: followUpNote(deferred.length, "This step's tool results returned"),
+    });
+  }
+  return deferred;
 }
 
 function selectionFromRequest(
@@ -414,8 +498,8 @@ async function handleChatCompletions(
     // exactly once.
     const freshSteering = collectSteeringMessages(messages)
       .map((m) => ({
+        ...m,
         key: createHash("sha1").update(m.key).digest("hex"),
-        text: m.text,
       }))
       .filter((m) => !existing!.forwardedSteering.has(m.key));
     const resolvable = [...existing.pendingTools.keys()].filter((id) =>
@@ -423,20 +507,33 @@ async function handleChatCompletions(
     );
     const steeringToolId =
       freshSteering.length > 0 ? resolvable.at(-1) : undefined;
+    // Must run before the loop below resolves (and forgets) the tools.
+    const toolDeferred = attachPromotedToolMedia(messages, toolResults, existing);
     for (const [toolId, tool] of existing.pendingTools) {
       const result = toolResults.get(toolId);
       if (result !== undefined) {
         tool.resolve(
-          toolId === steeringToolId
-            ? withSteering(result, freshSteering.map((m) => m.text))
-            : result,
+          toolId === steeringToolId ? withSteering(result, freshSteering) : result,
         );
         existing.pendingTools.delete(toolId);
         resolved++;
       }
     }
+    if (toolDeferred.length > 0) {
+      existing.followUps.push(
+        { type: "text", text: "From the tool results of your last step:" },
+        ...toolDeferred,
+      );
+    }
     if (steeringToolId) {
       for (const m of freshSteering) existing.forwardedSteering.add(m.key);
+      const steeringDeferred = freshSteering.flatMap((m) => m.deferred);
+      if (steeringDeferred.length > 0) {
+        existing.followUps.push(
+          { type: "text", text: "Attached by the user while you were working:" },
+          ...steeringDeferred,
+        );
+      }
       log.info("[opencode-claude] forwarding mid-turn user messages", {
         conversationKey: existing.conversationKey,
         messages: freshSteering.length,
@@ -634,6 +731,13 @@ async function handleChatCompletions(
   const titleSource = [...messages]
     .reverse()
     .find((message) => message.role === "user");
+  // Bridged turns keep their prompt stream open so attachments that cannot
+  // ride a tool result can follow as one more message after Claude's result.
+  const promptChannel = bridgeOpenCodeTools
+    ? createPromptChannel(
+        typeof contextualPrompt === "string" ? contextualPrompt || " " : contextualPrompt,
+      )
+    : null;
   const queryPrompt: string | AsyncIterable<SdkUserPrompt> = metaKind === "title"
     ? [
         "Create a concise 3-7 word session title for the request quoted below.",
@@ -644,9 +748,11 @@ async function handleChatCompletions(
         extractTextContent(titleSource?.content).trim(),
         "</request>",
       ].join("\n")
-    : typeof contextualPrompt === "string"
-      ? contextualPrompt || " "
-      : promptAsStream(contextualPrompt);
+    : bridgeOpenCodeTools
+      ? promptChannel!.iterable
+      : typeof contextualPrompt === "string"
+        ? contextualPrompt || " "
+        : promptAsStream(contextualPrompt);
 
   const hasTodoWrite = openCodeToolNames.includes("todowrite");
   const utilitySystemPrompt = isMetaRequest
@@ -711,6 +817,15 @@ async function handleChatCompletions(
       ...(chatAppend ? { append: chatAppend } : {}),
     },
   });
+  if (promptChannel) {
+    // However the turn ends (result, abort, teardown), release the prompt
+    // stream so the SDK's input loop doesn't wait on it forever.
+    const closeHandle = handle.close;
+    handle.close = () => {
+      promptChannel.end();
+      closeHandle();
+    };
+  }
 
   const bridge: ParkedBridge = {
     id: bridgeId,
@@ -719,6 +834,8 @@ async function handleChatCompletions(
     pendingTools,
     seenAssistantUsageIds: new Set(),
     forwardedSteering: new Set(),
+    forwardedMedia: new Set(),
+    followUps: [],
     createdAt: Date.now(),
   };
   putBridge(bridge);
@@ -817,6 +934,29 @@ async function handleChatCompletions(
             cwd,
           });
         }
+        if (isResultEvent(event) && promptChannel) {
+          if (bridge.followUps.length > 0 && !isErrorResult(event)) {
+            // Attachments announced during the turn (PDFs, URL media) go in
+            // as one more user message; Claude Code answers it as the next
+            // turn of the same process, streamed into this same response.
+            const blocks = bridge.followUps.splice(0);
+            log.info("[opencode-claude] delivering attachments in a follow-up turn", {
+              conversationKey,
+              blocks: blocks.length,
+            });
+            promptChannel.push(followUpPrompt(blocks));
+            // Keep the two turns' texts apart in the one OpenCode reply.
+            yield {
+              type: "stream_event",
+              event: {
+                type: "content_block_delta",
+                delta: { type: "text_delta", text: "\n\n" },
+              },
+            };
+            continue;
+          }
+          promptChannel.end();
+        }
         yield event;
       }
     } finally {
@@ -848,6 +988,18 @@ async function handleChatCompletions(
   return collectTurnResponse(consumeStream(), body.model || model, bridge);
 }
 
+
+function isResultEvent(event: unknown): boolean {
+  return (
+    !!event &&
+    typeof event === "object" &&
+    (event as { type?: unknown }).type === "result"
+  );
+}
+
+function isErrorResult(event: unknown): boolean {
+  return (event as { is_error?: unknown }).is_error === true;
+}
 
 function extractSessionId(event: unknown): string | null {
   if (!event || typeof event !== "object") return null;

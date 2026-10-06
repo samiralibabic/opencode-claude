@@ -1580,6 +1580,8 @@ async function main() {
         pendingTools: new Map(),
         seenAssistantUsageIds: new Set(),
         forwardedSteering: new Set(),
+        forwardedMedia: new Set(),
+        followUps: [],
         createdAt: Date.now(),
       });
       await hooks.event!({ event: {

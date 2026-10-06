@@ -2,7 +2,7 @@
  * Parked Claude Agent SDK turns waiting for OpenCode tool results
  * (Cursor bridge-pool pattern).
  */
-import type { McpToolResultContent } from "./prompt.js";
+import type { AnthropicContentBlock, McpToolResultContent } from "./prompt.js";
 import type { ClaudeQueryHandle } from "./query.js";
 
 export type ParkedToolCall = {
@@ -22,6 +22,13 @@ export type ParkedBridge = {
   seenAssistantUsageIds: Set<string>;
   /** Keys of mid-turn user messages already handed to Claude (sha1). */
   forwardedSteering: Set<string>;
+  /** Hashes of tool-result media already handed to Claude. */
+  forwardedMedia: Set<string>;
+  /**
+   * Attachments that cannot ride a tool result (PDFs, URL media), sent as a
+   * follow-up message when the current turn ends.
+   */
+  followUps: AnthropicContentBlock[];
   createdAt: number;
   /** Continues consuming the SDK stream after tools resolve. */
   continueStream?: () => AsyncGenerator<unknown, void, unknown>;

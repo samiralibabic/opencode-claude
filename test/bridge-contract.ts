@@ -418,6 +418,130 @@ async function toolSurface(ctx: Ctx) {
   })).json();
 }
 
+const PNG_B64 =
+  "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg==";
+const PDF_B64 = "JVBERi0xLjAK";
+const imagePart = { type: "image_url", image_url: { url: `data:image/png;base64,${PNG_B64}` } };
+const pdfPart = {
+  type: "file",
+  file: { filename: "spec.pdf", file_data: `data:application/pdf;base64,${PDF_B64}` },
+};
+
+async function attachments(ctx: Ctx) {
+  const { mediaForRunningTurn, SYNTHETIC_TOOL_MEDIA_PROMPT } = await import("../src/prompt.ts");
+
+  // Images can ride a tool result; PDFs and URL media wait for a follow-up.
+  const split = mediaForRunningTurn([
+    { type: "text", text: "x" },
+    imagePart,
+    pdfPart,
+    { type: "image_url", image_url: { url: "https://example.com/a.png" } },
+  ]);
+  assert.deepEqual(split.images, [{ type: "image", data: PNG_B64, mimeType: "image/png" }]);
+  assert.deepEqual(split.deferred.map((b) => b.type), ["document", "image"]);
+
+  const { post, proxy } = ctx;
+  const mediaMessage = (...parts: unknown[]) => ({
+    role: "user",
+    content: [{ type: "text", text: SYNTHETIC_TOOL_MEDIA_PROMPT }, ...parts],
+  });
+
+  /**
+   * One bridged turn: Claude calls `read`; OpenCode answers with `afterResult`
+   * appended. Returns the tool result Claude saw, any follow-up message the
+   * plugin sent, and the text OpenCode received.
+   */
+  async function run(session: string, afterResult: unknown[]) {
+    let toolResult: Array<Record<string, any>> = [];
+    let followUp: any = null;
+    proxy.setClaudeQueryStarter(async (params) => {
+      const input = (params.prompt as AsyncIterable<any>)[Symbol.asyncIterator]();
+      return mockHandle(
+        (async function* () {
+          await input.next();
+          yield { type: "system", subtype: "init", session_id: `${session}-sess` };
+          toolResult = (await callTool(params, "read", { filePath: "/x" })).content;
+          yield { type: "user", message: { role: "user", content: [] } };
+          yield textDelta("STEP1 ");
+          yield { type: "result", is_error: false, usage: {} };
+          // A follow-up arrives only when attachments were deferred; then
+          // Claude Code answers it as the next turn of the same process.
+          const next = await Promise.race([
+            input.next(),
+            new Promise((r) => setTimeout(() => r({ done: true }), 300)),
+          ]) as IteratorResult<any>;
+          if (next.done) return;
+          followUp = next.value;
+          yield textDelta("DOC SEEN");
+          yield { type: "result", is_error: false, usage: {} };
+        })(),
+      );
+    });
+    const readTool = {
+      type: "function",
+      function: {
+        name: "read",
+        description: "Read a file",
+        parameters: {
+          type: "object",
+          properties: { filePath: { type: "string" } },
+          required: ["filePath"],
+        },
+      },
+    };
+    const first = (await (await post(session, {
+      tools: [readTool],
+      messages: [{ role: "user", content: "read it" }],
+    })).json()) as any;
+    const call = first.choices[0].message.tool_calls[0];
+    const done = (await (await post(session, {
+      tools: [readTool],
+      messages: [
+        { role: "user", content: "read it" },
+        { role: "assistant", content: null, tool_calls: [call] },
+        { role: "tool", tool_call_id: call.id, content: "file read" },
+        ...afterResult,
+      ],
+    })).json()) as any;
+    return { toolResult, followUp, text: String(done.choices[0].message.content) };
+  }
+
+  // Image a tool returned (read on a PNG, a screenshot): inside the result.
+  const img = await run("media-img", [mediaMessage(imagePart)]);
+  assert.deepEqual(img.toolResult.find((b) => b.type === "image"), {
+    type: "image",
+    data: PNG_B64,
+    mimeType: "image/png",
+  });
+  assert.equal(img.followUp, null, "no follow-up needed for images");
+  assert.match(img.text, /STEP1/);
+
+  // PDF a tool returned: announced in the result, then delivered natively
+  // in a follow-up message, answered in the same OpenCode response.
+  const pdf = await run("media-pdf", [mediaMessage(pdfPart)]);
+  assert.match(
+    pdf.toolResult.map((b) => b.text ?? "").join("\n"),
+    /follow-up message as soon as you end this turn/,
+  );
+  const blocks = pdf.followUp.message.content as any[];
+  assert.equal(blocks.filter((b) => b.type === "document").length, 1);
+  assert.equal(blocks.find((b) => b.type === "document").source.data, PDF_B64);
+  assert.match(pdf.text, /STEP1 \n\nDOC SEEN/);
+
+  // The user pastes an image and a PDF while the tool runs.
+  const steer = await run("media-steer", [
+    { role: "user", content: [{ type: "text", text: "use this mockup" }, imagePart, pdfPart] },
+  ]);
+  const reminder = steer.toolResult.map((b) => b.text ?? "").join("\n");
+  assert.match(reminder, /use this mockup/);
+  assert.match(reminder, /attached 1 image/);
+  assert.ok(steer.toolResult.some((b) => b.type === "image" && b.data === PNG_B64));
+  assert.ok(
+    (steer.followUp.message.content as any[]).some((b) => b.type === "document"),
+    "pasted PDF delivered in the follow-up",
+  );
+}
+
 async function queryOptions() {
   const { startClaudeQuery } = await import("../src/query.ts");
   const capture = async (params: Record<string, unknown>) => {
@@ -463,6 +587,7 @@ async function main() {
     await isolation(ctx);
     await systemContext(ctx);
     await toolSurface(ctx);
+    await attachments(ctx);
     await queryOptions();
   } finally {
     ctx.proxy.setClaudeQueryStarter(null);
