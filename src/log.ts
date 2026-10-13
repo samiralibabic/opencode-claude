@@ -1,10 +1,13 @@
 /**
  * Debug-gated logger with always-on errors.
  *
- * OpenCode surfaces plugin stderr in the TUI / `--print-logs`, but does NOT
- * write those lines into `~/.local/share/opencode/log/opencode.log`. We therefore:
- * 1. Emit to stderr (so `--print-logs` / TUI can show them)
- * 2. Mirror to `~/.local/share/opencode-claude/debug.log` when debugging
+ * OpenCode does NOT write plugin stderr into
+ * `~/.local/share/opencode/log/opencode.log`, and the TUI does not capture it:
+ * a stray stderr line is painted straight over the interface. We therefore:
+ * 1. Write warn / error to `~/.local/share/opencode-claude/debug.log` always
+ * 2. Echo to stderr (for `--print-logs`) only when debugging
+ *
+ * Failures the user must see reach OpenCode as HTTP errors, not as log lines.
  *
  * Levels:
  * - info: only when OPENCODE_CLAUDE_DEBUG is on
@@ -54,10 +57,11 @@ function writeFile(line: string): void {
 
 function emit(level: "info" | "warn" | "error", args: unknown[]): void {
   const line = formatLine(level, args);
-  // stderr for OpenCode TUI / --print-logs
-  console.error(line);
-  // durable mirror so logs can be pulled even without --print-logs
-  if (level !== "info" || debugEnabled()) {
+  const debug = debugEnabled();
+  // stderr only on request: inside the TUI it corrupts the screen
+  if (debug) console.error(line);
+  // durable record so warnings survive without --print-logs
+  if (level !== "info" || debug) {
     writeFile(line);
   }
 }

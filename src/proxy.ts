@@ -10,6 +10,7 @@
  */
 import { createHash, randomUUID } from "node:crypto";
 import {
+  abandonBridge,
   deleteBridge,
   findBridgeByConversation,
   findBridgeByPendingTool,
@@ -981,6 +982,11 @@ async function handleChatCompletions(
   if (stream) {
     const probe = await probeTurnEvents(consumeStream());
     if (probe.status === "failed") {
+      // Esc-Esc before the first output: the idle hook tore the turn down,
+      // which ends the SDK stream empty. Not a failure.
+      if (bridge.abandoned || req.signal.aborted) {
+        return cancelledResponse(conversationKey);
+      }
       return failureResponse(probe.errorText, conversationKey);
     }
     return streamOpenAIResponse(probe.replay, body.model || model, bridge);
@@ -1272,6 +1278,7 @@ async function collectTurnResponse(
     errorText &&
     (!sawContent || classifyClaudeFailure(errorText) === "rate_limit")
   ) {
+    if (bridge.abandoned) return cancelledResponse(bridge.conversationKey);
     return failureResponse(errorText, bridge.conversationKey);
   }
 
@@ -1413,6 +1420,27 @@ async function probeTurnEvents(
     return fail(err instanceof Error ? err.message : String(err));
   }
   return fail("Claude Code ended the turn without any output");
+}
+
+/**
+ * Answer for a turn OpenCode abandoned before it produced content. OpenCode
+ * has normally dropped the request already, and this is no failure: no
+ * warning, no rate-limit or dead-session bookkeeping.
+ */
+function cancelledResponse(conversationKey: string): Response {
+  log.info("[opencode-claude] turn cancelled before any output", {
+    conversationKey,
+  });
+  return Response.json(
+    {
+      error: {
+        message: "Claude turn cancelled",
+        type: "cancelled",
+        code: "claude_turn_cancelled",
+      },
+    },
+    { status: 499 },
+  );
 }
 
 /**
@@ -1720,7 +1748,7 @@ function streamOpenAIResponse(
       // the turn down instead of leaking the CLI process and the bridge.
       streamClosed = true;
       if (heartbeat) clearInterval(heartbeat);
-      deleteBridge(bridge.id);
+      abandonBridge(bridge.id);
     },
   });
 

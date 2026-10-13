@@ -750,7 +750,8 @@ async function main() {
     assert.equal(detectMetaRequestKind(normalMessages), null);
   }
 
-  // Logger: errors always emit; info is debug-gated; durable file mirror
+  // Logger: errors always reach debug.log; stderr (painted over the TUI) and
+  // info are debug-gated
   {
     const { spawnSync } = await import("node:child_process");
     const { readFileSync, unlinkSync, existsSync } = await import("node:fs");
@@ -772,7 +773,8 @@ async function main() {
     );
     assert.equal(off.status, 0, off.stderr);
     assert.doesNotMatch(off.stderr, /SILENT_INFO/);
-    assert.match(off.stderr, /ALWAYS_ERROR/);
+    assert.doesNotMatch(off.stderr, /ALWAYS_ERROR/);
+    assert.match(readFileSync(logPath, "utf8"), /ALWAYS_ERROR/);
 
     const on = spawnSync(
       "bun",

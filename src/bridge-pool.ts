@@ -30,6 +30,12 @@ export type ParkedBridge = {
    */
   followUps: AnthropicContentBlock[];
   createdAt: number;
+  /**
+   * Torn down because OpenCode abandoned the turn (Esc-Esc / client went
+   * away). The SDK stream then ends without output; that is a cancellation,
+   * not a failed turn.
+   */
+  abandoned?: boolean;
   /** Continues consuming the SDK stream after tools resolve. */
   continueStream?: () => AsyncGenerator<unknown, void, unknown>;
 };
@@ -85,6 +91,14 @@ export function deleteBridge(id: string): void {
   }
   bridge.handle.close();
   bridges.delete(id);
+}
+
+/** Tear down a turn OpenCode abandoned; see ParkedBridge.abandoned. */
+export function abandonBridge(id: string): void {
+  const bridge = bridges.get(id);
+  if (!bridge) return;
+  bridge.abandoned = true;
+  deleteBridge(id);
 }
 
 export function clearAllBridges(): void {
