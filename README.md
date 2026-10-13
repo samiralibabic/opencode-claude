@@ -161,7 +161,7 @@ bun run build
 bun run test
 ```
 
-Debug logging: `OPENCODE_CLAUDE_DEBUG=1`.
+Debug logging: `OPENCODE_CLAUDE_DEBUG=1`. Warnings and errors always go to `~/.local/share/opencode-claude/debug.log`; they reach stderr only with debug logging on, because the OpenCode TUI paints stray stderr over the screen.
 
 Optional knobs:
 
