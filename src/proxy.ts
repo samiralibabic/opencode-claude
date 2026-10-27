@@ -671,10 +671,10 @@ async function handleChatCompletions(
 
   let resume = isMetaRequest ? undefined : getForeignSessionId(conversationKey);
   if (resume && !findClaudeSessionFile(resume)) {
-    // The claude CLI resumes by looking the session up on disk. A missing
-    // transcript (cleanup, different machine, pruned projects dir) would
-    // silently start a context-free session — drop the stale binding and
-    // transfer the conversation history into the prompt instead.
+    // The claude CLI resumes from the transcript on disk. When no projects
+    // folder has it (cleanup, different machine, pruned projects dir), the CLI
+    // would fail the turn with "No conversation found" — drop the stale
+    // binding and transfer the conversation history into the prompt instead.
     log.warn("[opencode-claude] stored Claude session file missing; transferring history", {
       conversationKey,
       foreignSessionId: resume,

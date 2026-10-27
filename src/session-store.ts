@@ -93,10 +93,14 @@ export function conversationKeyFromMessages(
 
 /**
  * Locate the Claude Code transcript for a foreign session id. The Agent SDK
- * resumes via the claude CLI, which looks the session up under
- * ~/.claude/projects/<cwd-slug>/ — a missing file means resume silently starts
- * (or errors into) a context-free session, so callers must fall back to
- * history injection instead.
+ * resumes via the claude CLI, which (checked in 2.1.289) looks for the
+ * session in ~/.claude/projects/<cwd-slug>/ first, then in the folders of the
+ * repository's other git worktrees, and finally in every projects folder,
+ * accepting a file there only if exactly one folder has it. Searching every
+ * folder here therefore matches what the CLI can resume. When the CLI cannot
+ * load the session it fails the turn with "No conversation found" (see
+ * forgetDeadSession in proxy.ts), so callers transfer the history into the
+ * prompt when no folder has the file.
  */
 export function findClaudeSessionFile(
   foreignSessionId: string,
