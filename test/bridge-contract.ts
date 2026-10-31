@@ -516,6 +516,18 @@ async function attachments(ctx: Ctx) {
   assert.equal(img.followUp, null, "no follow-up needed for images");
   assert.match(img.text, /STEP1/);
 
+  // Past an agent's step limit OpenCode ends every request with a plain
+  // assistant message (MAX_STEPS_PROMPT). The image must still ride the result.
+  const capped = await run("media-img-max-steps", [
+    mediaMessage(imagePart),
+    { role: "assistant", content: "CRITICAL - MAXIMUM STEPS REACHED" },
+  ]);
+  assert.deepEqual(capped.toolResult.find((b) => b.type === "image"), {
+    type: "image",
+    data: PNG_B64,
+    mimeType: "image/png",
+  });
+
   // PDF a tool returned: announced in the result, then delivered natively
   // in a follow-up message, answered in the same OpenCode response.
   const pdf = await run("media-pdf", [mediaMessage(pdfPart)]);
