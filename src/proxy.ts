@@ -376,9 +376,13 @@ function attachPromotedToolMedia(
   toolResults: Map<string, McpToolResultContent[]>,
   bridge: ParkedBridge,
 ): AnthropicContentBlock[] {
+  // The step is the last assistant message that called tools. Past an agent's
+  // step limit OpenCode appends a plain assistant message (MAX_STEPS_PROMPT)
+  // after the step's results; stopping there would drop the step's media.
   let lastAssistant = -1;
   for (let i = messages.length - 1; i >= 0; i--) {
-    if (messages[i]?.role === "assistant") {
+    const msg = messages[i];
+    if (msg?.role === "assistant" && (msg.tool_calls?.length ?? 0) > 0) {
       lastAssistant = i;
       break;
     }
