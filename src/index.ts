@@ -11,6 +11,14 @@
  */
 import type { Hooks, Plugin, PluginInput } from "@opencode-ai/plugin";
 import {
+  accountLabel,
+  configureAccounts,
+  getAccounts,
+  isAccountProvider,
+  refreshAccountStatuses,
+} from "./accounts.js";
+import {
+  ACCOUNT_HEADER,
   DIRECTORY_HEADER,
   EFFORT_HEADER,
   OPENAI_COMPATIBLE_NPM,
@@ -46,6 +54,11 @@ import {
   getProxyPort,
   startProxy,
 } from "./proxy.js";
+import {
+  followParentAccount,
+  rememberSessionProvider,
+  type ParentLookup,
+} from "./session-accounts.js";
 
 function zeroCost() {
   return {
@@ -168,6 +181,11 @@ function buildClaudeProviderModels(
   return providerModels;
 }
 
+/**
+ * Seed one provider per Claude account. All of them talk to the same proxy
+ * with the same model catalog; the account header (chat.headers) tells the
+ * proxy which login runs the turn.
+ */
 function ensureClaudeProviderConfig(
   config: Record<string, any>,
   models: ClaudeModel[],
@@ -175,7 +193,24 @@ function ensureClaudeProviderConfig(
   if (!config.provider || typeof config.provider !== "object") {
     config.provider = {};
   }
-  const existing = config.provider[PROVIDER_ID] ?? {};
+  const port = getProxyPort();
+  const baseURL = port ? `http://127.0.0.1:${port}/v1` : undefined;
+  const seededModels = Object.fromEntries(
+    models.map((model) => [model.id, buildConfigModelEntry(model)]),
+  );
+  for (const account of getAccounts()) {
+    seedAccountProvider(config.provider, account.provider, accountLabel(account), seededModels, baseURL);
+  }
+}
+
+function seedAccountProvider(
+  providers: Record<string, any>,
+  providerID: string,
+  label: string,
+  seededModels: Record<string, unknown>,
+  baseURL: string | undefined,
+): void {
+  const existing = providers[providerID] ?? {};
   const existingOptions =
     existing.options && typeof existing.options === "object"
       ? existing.options
@@ -185,17 +220,12 @@ function ensureClaudeProviderConfig(
       ? existing.models
       : {};
 
-  const port = getProxyPort();
-  const baseURL = port ? `http://127.0.0.1:${port}/v1` : undefined;
-  const seededModels = Object.fromEntries(
-    models.map((model) => [model.id, buildConfigModelEntry(model)]),
-  );
-  config.provider[PROVIDER_ID] = {
+  providers[providerID] = {
     ...existing,
     name:
       typeof existing.name === "string" && existing.name.trim()
         ? existing.name
-        : "Claude Code",
+        : label,
     npm: existing.npm ?? OPENAI_COMPATIBLE_NPM,
     options: {
       apiKey: "claude-code-proxy",
@@ -203,6 +233,13 @@ function ensureClaudeProviderConfig(
       ...existingOptions,
       // Live listener URL must win over any stale pinned baseURL in user config.
       ...(baseURL ? { baseURL } : {}),
+      // Also on calls that skip chat.headers (e.g. `opencode agent create`).
+      headers: {
+        ...(existingOptions.headers && typeof existingOptions.headers === "object"
+          ? existingOptions.headers
+          : {}),
+        [ACCOUNT_HEADER]: providerID,
+      },
     },
     // Seeded catalog first; user-declared model entries win.
     models: {
@@ -262,11 +299,24 @@ export function teardownBridgesForSession(sessionID: string): string[] {
  * with `claude` gets the sign-in relay, a host without it gets the install
  * action. `authorize` re-detects at run time, so the install action still
  * relays the sign-in right after a successful install.
+ *
+ * Options: `accounts` adds Claude subscriptions as extra providers, each
+ * signed in under its own CLAUDE_CONFIG_DIR (see accounts.ts):
+ *   ["…/opencode-claude", { "accounts": [{ "provider": "claude-code-2", "configDir": "~/.claude-2" }] }]
  */
 export const ClaudeCodePlugin: Plugin = async (
   input: PluginInput,
+  options?: Record<string, unknown>,
 ): Promise<Hooks> => {
+  configureAccounts(options?.accounts);
   const cliPresent = await probeCliPresence();
+  const lookupParent: ParentLookup = async (sessionID) => {
+    const result = await input.client.session.get({ path: { id: sessionID } });
+    if (result.error || !result.data) {
+      throw new Error(`session ${sessionID} not found`);
+    }
+    return result.data.parentID ?? null;
+  };
   return {
     async config(config) {
       // Bind first (ephemeral port by default), then seed provider baseURL so
@@ -280,11 +330,39 @@ export const ClaudeCodePlugin: Plugin = async (
         );
       }
 
-      if (cliPresent) await refreshClaudeModels(input.directory);
+      // Account emails name the providers, so read them before seeding.
+      await Promise.all([
+        cliPresent ? refreshClaudeModels(input.directory) : undefined,
+        cliPresent ? refreshAccountStatuses() : undefined,
+      ]);
       ensureClaudeProviderConfig(
         config as Record<string, any>,
         getClaudeModels(),
       );
+    },
+
+    // A subagent pinned to a Claude account follows its parent onto the
+    // parent's current Claude account (session-accounts.ts). Each turn's
+    // user message carries the model the user picked, so it is recorded here
+    // for every provider — not from chat.headers, which also sees the
+    // session's title request on the small model.
+    "chat.message": async (hookInput, output) => {
+      const model = output.message.model;
+      if (!model?.providerID) return;
+      const target = await followParentAccount(
+        hookInput.sessionID,
+        model.providerID,
+        lookupParent,
+      );
+      if (target) {
+        log.info("[opencode-claude] subagent follows its parent's Claude account", {
+          sessionID: hookInput.sessionID,
+          from: model.providerID,
+          to: target,
+        });
+        output.message.model = { ...model, providerID: target };
+      }
+      rememberSessionProvider(hookInput.sessionID, output.message.model.providerID);
     },
 
     // session.idle: drop turns OpenCode abandoned (teardownBridgesForSession).
@@ -315,7 +393,8 @@ export const ClaudeCodePlugin: Plugin = async (
     },
 
     "chat.headers": async (hookInput, output) => {
-      if (hookInput.model.providerID !== PROVIDER_ID) return;
+      if (!isAccountProvider(hookInput.model.providerID)) return;
+      output.headers[ACCOUNT_HEADER] = hookInput.model.providerID;
       const messageModel = hookInput.message.model as {
         variant?: unknown;
       };
@@ -338,7 +417,7 @@ export const ClaudeCodePlugin: Plugin = async (
     },
 
     "chat.params": async (hookInput, output) => {
-      if (hookInput.model.providerID !== PROVIDER_ID) return;
+      if (!isAccountProvider(hookInput.model.providerID)) return;
       delete output.options.reasoningEffort;
     },
 

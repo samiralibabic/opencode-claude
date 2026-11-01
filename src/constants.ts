@@ -6,6 +6,8 @@ export const EFFORT_HEADER = "x-opencode-claude-effort";
 export const SESSION_HEADER = "x-opencode-claude-session";
 /** Active OpenCode project directory forwarded to the local Agent SDK proxy. */
 export const DIRECTORY_HEADER = "x-opencode-claude-directory";
+/** Provider ID of the Claude account a request runs on (see accounts.ts). */
+export const ACCOUNT_HEADER = "x-opencode-claude-account";
 
 export const EFFORT_LEVELS = [
   "low",

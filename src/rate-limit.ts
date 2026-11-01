@@ -13,7 +13,9 @@
  *   active instead of spawning a doomed Agent SDK turn,
  * - append the reset countdown to the streamed error note.
  *
- * Store: $XDG_DATA_HOME/opencode-claude/rate-limit.json
+ * Store: $XDG_DATA_HOME/opencode-claude/rate-limit.json for the default
+ * account, rate-limit.<provider>.json next to it for each extra account —
+ * every subscription has its own limits.
  * Env:
  * - OPENCODE_CLAUDE_RATE_LIMIT_STORE — override store path (tests)
  * - OPENCODE_CLAUDE_RATE_LIMIT_FAST_FAIL=0 — disable the 429 gate
@@ -21,6 +23,8 @@
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { dirname, join } from "node:path";
+import { accountLabel, findAccount, getAccounts } from "./accounts.js";
+import { PROVIDER_ID } from "./constants.js";
 
 export type ClaudeRateLimitState = {
   /** Hard limit confirmed by an error result — gates new turns. */
@@ -45,16 +49,19 @@ export type ClaudeRateLimitState = {
 /** When a hard limit error carries no reset time, block new turns briefly. */
 const FALLBACK_BLOCK_MS = 10 * 60 * 1000;
 
-function storePath(): string {
-  const override = process.env.OPENCODE_CLAUDE_RATE_LIMIT_STORE;
-  if (override && override.trim()) return override.trim();
+function storePath(account: string = PROVIDER_ID): string {
+  const override = process.env.OPENCODE_CLAUDE_RATE_LIMIT_STORE?.trim();
   const xdg = process.env.XDG_DATA_HOME;
   const base = xdg ? xdg : join(homedir(), ".local", "share");
-  return join(base, "opencode-claude", "rate-limit.json");
+  const path = override || join(base, "opencode-claude", "rate-limit.json");
+  if (account === PROVIDER_ID) return path;
+  return path.endsWith(".json")
+    ? `${path.slice(0, -".json".length)}.${account}.json`
+    : `${path}.${account}`;
 }
 
-function readState(): ClaudeRateLimitState | null {
-  const path = storePath();
+function readState(account?: string): ClaudeRateLimitState | null {
+  const path = storePath(account);
   if (!existsSync(path)) return null;
   try {
     const parsed = JSON.parse(readFileSync(path, "utf8"));
@@ -65,9 +72,9 @@ function readState(): ClaudeRateLimitState | null {
   }
 }
 
-function writeState(state: ClaudeRateLimitState): void {
+function writeState(state: ClaudeRateLimitState, account?: string): void {
   try {
-    const path = storePath();
+    const path = storePath(account);
     mkdirSync(dirname(path), { recursive: true });
     writeFileSync(path, JSON.stringify(state, null, 2) + "\n", "utf8");
   } catch {
@@ -87,11 +94,15 @@ function asString(value: unknown): string | undefined {
  * Record a structured SDK `rate_limit_event` payload. Never sets `limited`
  * on its own — the SDK reports "rejected" for turns that still complete
  * (overage pool rejection); only a hard error result confirms the limit.
+ * `account` is the provider ID of the Claude account that reported it.
  */
-export function recordRateLimitInfo(info: unknown): ClaudeRateLimitState | null {
+export function recordRateLimitInfo(
+  info: unknown,
+  account?: string,
+): ClaudeRateLimitState | null {
   if (!info || typeof info !== "object") return null;
   const raw = info as Record<string, unknown>;
-  const prev = readState() ?? { limited: false, updatedAt: 0 };
+  const prev = readState(account) ?? { limited: false, updatedAt: 0 };
   const resetsAtSec = asNumber(raw.resetsAt);
   const next: ClaudeRateLimitState = {
     ...prev,
@@ -116,7 +127,7 @@ export function recordRateLimitInfo(info: unknown): ClaudeRateLimitState | null 
         : prev.resetsAt,
     updatedAt: Date.now(),
   };
-  writeState(next);
+  writeState(next, account);
   return next;
 }
 
@@ -190,9 +201,10 @@ export function parseResetTimeFromText(
  */
 export function recordRateLimitErrorText(
   text: string,
+  account?: string,
 ): ClaudeRateLimitState | null {
   if (!text || !isClaudeRateLimitText(text)) return null;
-  const prev = readState() ?? { limited: false, updatedAt: 0 };
+  const prev = readState(account) ?? { limited: false, updatedAt: 0 };
   const resetsAt = parseResetTimeFromText(text) ?? prev.resetsAt;
   const now = Date.now();
   const next: ClaudeRateLimitState = {
@@ -204,7 +216,7 @@ export function recordRateLimitErrorText(
     message: text.trim().slice(0, 300),
     updatedAt: now,
   };
-  writeState(next);
+  writeState(next, account);
   return next;
 }
 
@@ -213,6 +225,7 @@ export function normalizeClaudeErrorText(text: string): string {
   return text
     .replace(/^\[claude-code error\]\s*/i, "")
     .replace(/^claude code returned an error result:\s*/i, "")
+    .replace(/\s*·\s*to continue now, switch this session to .*$/i, "") // account hint
     .replace(/\s*·\s*limit resets in .*$/i, "") // appended countdown suffix
     .replace(/\s+/g, " ")
     .trim()
@@ -245,13 +258,16 @@ export type RateLimitSnapshot = {
 };
 
 /** Current snapshot; auto-clears an expired hard block (self-healing). */
-export function getRateLimitSnapshot(now: number = Date.now()): RateLimitSnapshot {
-  const state = readState();
+export function getRateLimitSnapshot(
+  now: number = Date.now(),
+  account?: string,
+): RateLimitSnapshot {
+  const state = readState(account);
   if (!state) return { limited: false };
   let { limited, limitedUntil } = state;
   if (limited && limitedUntil !== undefined && now >= limitedUntil) {
     limited = false;
-    writeState({ ...state, limited: false, updatedAt: now });
+    writeState({ ...state, limited: false, updatedAt: now }, account);
   }
   const resetsAt = state.resetsAt;
   const resetInSeconds =
@@ -294,13 +310,16 @@ export type RateLimitGate =
  * until the known/estimated reset. OPENCODE_CLAUDE_RATE_LIMIT_FAST_FAIL=0
  * disables the gate entirely.
  */
-export function rateLimitGate(now: number = Date.now()): RateLimitGate {
+export function rateLimitGate(
+  now: number = Date.now(),
+  account?: string,
+): RateLimitGate {
   const flag = (process.env.OPENCODE_CLAUDE_RATE_LIMIT_FAST_FAIL ?? "")
     .toLowerCase();
   if (flag === "0" || flag === "false" || flag === "off") {
     return { blocked: false };
   }
-  const snap = getRateLimitSnapshot(now);
+  const snap = getRateLimitSnapshot(now, account);
   if (!snap.limited) return { blocked: false };
   const until = snap.limitedUntil ?? snap.resetsAt;
   const retryAfterSeconds =
@@ -320,10 +339,11 @@ export function rateLimitGate(now: number = Date.now()): RateLimitGate {
 }
 
 // ---------------------------------------------------------------------------
-// Stream note dedupe — one rate-limit note per status/threshold per process.
+// Stream note dedupe — one rate-limit note per status/threshold per account
+// per process.
 // ---------------------------------------------------------------------------
 
-let lastNoteSignature: string | null = null;
+const lastNoteSignatures = new Map<string, string>();
 
 /**
  * Build a short user-facing note for a structured event, but only when the
@@ -339,6 +359,7 @@ let lastNoteSignature: string | null = null;
 export function maybeRateLimitNote(
   state: ClaudeRateLimitState | null,
   fresh?: Record<string, unknown>,
+  account: string = PROVIDER_ID,
 ): string | null {
   if (!state || !state.status) return null;
   const freshStatus = fresh ? asString(fresh.status) : undefined;
@@ -354,7 +375,7 @@ export function maybeRateLimitNote(
     (fresh ? freshUtil !== undefined && freshUtil >= 0.9
           : util !== undefined && util >= 0.9);
   if (!interesting) {
-    lastNoteSignature = null;
+    lastNoteSignatures.delete(account);
     return null;
   }
   const bucket =
@@ -366,10 +387,12 @@ export function maybeRateLimitNote(
           ? "u95"
           : "u90";
   const signature = `${status}:${bucket}:${state.resetsAt ?? ""}`;
-  if (signature === lastNoteSignature) return null;
-  lastNoteSignature = signature;
+  if (signature === lastNoteSignatures.get(account)) return null;
+  lastNoteSignatures.set(account, signature);
 
-  const parts = ["[rate-limit] Claude"];
+  // With several accounts, name the one whose window this is.
+  const known = getAccounts().length > 1 ? findAccount(account) : undefined;
+  const parts = [`[rate-limit] ${known ? accountLabel(known) : "Claude"}`];
   if (state.rateLimitType) parts.push(state.rateLimitType.replace(/_/g, " "));
   if (status === "rejected") {
     parts.push("request rejected by limiter");
@@ -387,5 +410,5 @@ export function maybeRateLimitNote(
 
 /** Test helper: reset process-local note dedupe. */
 export function __resetRateLimitNoteDedupe(): void {
-  lastNoteSignature = null;
+  lastNoteSignatures.clear();
 }

@@ -8,6 +8,12 @@
  * - rate_limit → 429 + Retry-After (the gate store already knows the reset)
  * - unknown    → 500
  */
+import {
+  accountLabel,
+  accountLoginCommand,
+  otherAccounts,
+  type ClaudeAccount,
+} from "./accounts.js";
 import { isClaudeRateLimitText } from "./rate-limit.js";
 
 export type ClaudeFailureKind = "auth" | "rate_limit" | "unknown";
@@ -45,13 +51,30 @@ export function failureTypeFor(kind: ClaudeFailureKind): string {
 }
 
 /** User-facing guidance appended to hard failures. */
-export function failureHintFor(kind: ClaudeFailureKind): string {
+export function failureHintFor(kind: ClaudeFailureKind, account?: ClaudeAccount): string {
   switch (kind) {
     case "auth":
+      if (account?.configDir) {
+        return `Claude Code credentials for ${accountLabel(account)} are missing or expired. Run \`${accountLoginCommand(account)}\` in a terminal, then retry — retrying is pointless until then.`;
+      }
       return "Claude Code credentials are invalid or expired. Run `claude auth login`, then restart OpenCode — retrying is pointless until then.";
     case "rate_limit":
       return "Claude subscription limit is active; wait for the reset instead of retrying.";
     default:
       return "";
   }
+}
+
+const SWITCH_HINT_MARK = "in the model picker";
+
+/**
+ * Append the other Claude accounts to a limit message, so the user can move
+ * the session instead of waiting for the reset. No-op with a single account
+ * or when the text already carries the hint.
+ */
+export function withAccountSwitchHint(text: string, account?: ClaudeAccount): string {
+  if (!account || text.includes(SWITCH_HINT_MARK)) return text;
+  const others = otherAccounts(account).map(accountLabel);
+  if (others.length === 0) return text;
+  return `${text} · To continue now, switch this session to ${others.join(" or ")} ${SWITCH_HINT_MARK}.`;
 }
