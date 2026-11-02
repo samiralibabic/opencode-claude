@@ -1,6 +1,6 @@
 # opencode-claude
 
-[![npm](https://img.shields.io/npm/v/%40samiralibabic%2Fopencode-claude?style=flat&labelColor=100F0F&color=24837B)](https://www.npmjs.com/package/@samiralibabic/opencode-claude)
+[![npm](https://img.shields.io/npm/v/opencode-claude?style=flat&labelColor=100F0F&color=24837B)](https://www.npmjs.com/package/opencode-claude)
 [![License](https://img.shields.io/badge/license-MIT-black?style=flat&labelColor=100F0F&color=EC8B49)](LICENSE)
 
 > **A maintained fork for OpenCode 1.** [`@openchamber/opencode-claude`](https://github.com/openchamber/opencode-claude) requires OpenCode 2 since 1.0 and was archived on 2026-10-31, superseded by OpenCode's native Claude Code support (2.2.3 and later). This fork continues its last OpenCode 1 release, `0.14.0`, with backported and local fixes: model discovery, mid-turn messages, tool images and PDFs, several Claude accounts and parallel subagents ([changelog](CHANGELOG.md)). On OpenCode 2, use OpenCode's own Claude Code support instead.
@@ -48,17 +48,17 @@ Subscription limit state is tracked with its reset time. `GET /v1/rate-limit` an
 ### 1. Install the plugin
 
 ```bash
-npm install -g @samiralibabic/opencode-claude
+npm install -g opencode-claude
 ```
 
 Or with OpenCode:
 
 ```bash
 # global (recommended)
-opencode plugin @samiralibabic/opencode-claude -g
+opencode plugin opencode-claude -g
 
 # or project-local (writes .opencode/opencode.json)
-opencode plugin @samiralibabic/opencode-claude
+opencode plugin opencode-claude
 ```
 
 ### 2. Register it in OpenCode
@@ -68,7 +68,7 @@ Add (or merge) this into `~/.config/opencode/opencode.json`:
 ```jsonc
 {
   "$schema": "https://opencode.ai/config.json",
-  "plugin": ["@samiralibabic/opencode-claude"],
+  "plugin": ["opencode-claude"],
   "provider": {
     "claude-code": { "name": "Claude Code" }
   }
@@ -132,7 +132,7 @@ Each extra subscription becomes its own provider with the same models, signed in
    ```jsonc
    {
      "plugin": [
-       ["@samiralibabic/opencode-claude", {
+       ["opencode-claude", {
          "accounts": [{ "provider": "claude-code-2", "configDir": "~/.claude-2" }]
        }]
      ]
@@ -204,8 +204,8 @@ Optional knobs:
 
 | Symptom | Fix |
 | --- | --- |
-| Unknown provider `claude-code` | Install `@samiralibabic/opencode-claude` and restart OpenCode |
-| Claude Code missing from provider list | Confirm `plugin` includes `@samiralibabic/opencode-claude` and restart OpenCode |
+| Unknown provider `claude-code` | Install `opencode-claude` and restart OpenCode |
+| Claude Code missing from provider list | Confirm `plugin` includes `opencode-claude` and restart OpenCode |
 | Authentication error | Run `claude auth login`, verify `claude auth status --json`, then restart OpenCode |
 | 429 / rate-limit | Poll `GET /v1/rate-limit` or wait until `resetsAt`; the next turn resumes the same session |
 | Tools hang or invent output | Update to the latest plugin — park/resume MCP bridging is required |

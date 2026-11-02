@@ -2,7 +2,7 @@
 
 ## 0.15.0 - 2026-11-02
 
-First release of the fork as `@samiralibabic/opencode-claude`, for OpenCode 1. Upstream `@openchamber/opencode-claude` requires OpenCode 2 since 1.0 and was archived on 2026-10-31; this continues its `0.14.0` release.
+First release of the fork as `opencode-claude`, for OpenCode 1. Upstream `@openchamber/opencode-claude` requires OpenCode 2 since 1.0 and was archived on 2026-10-31; this continues its `0.14.0` release.
 
 - **Parallel subagents and read-only tools**: subagents (`task`) and read-only tools carry `readOnlyHint`, and a whole group Claude starts together reaches OpenCode in one step, so they run side by side (ported from upstream 1.1.0 and 1.2.1).
 - **Several Claude accounts**: the `accounts` option serves more subscriptions as extra providers, each signed in under its own `CLAUDE_CONFIG_DIR`; subagents follow their parent session's account.
