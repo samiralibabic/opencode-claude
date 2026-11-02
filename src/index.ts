@@ -7,7 +7,7 @@
  * 3. Native effort variants, session resume, tools, skills, and MCP
  *
  * Register in opencode.json:
- *   { "plugin": ["@samiralibabic/opencode-claude"] }
+ *   { "plugin": ["opencode-claude"] }
  */
 import type { Hooks, Plugin, PluginInput } from "@opencode-ai/plugin";
 import {
