@@ -1,5 +1,21 @@
 # Changelog
 
+## 0.15.0 - 2026-11-02
+
+First release of the fork as `@samiralibabic/opencode-claude`, for OpenCode 1. Upstream `@openchamber/opencode-claude` requires OpenCode 2 since 1.0 and was archived on 2026-10-31; this continues its `0.14.0` release.
+
+- **Parallel subagents and read-only tools**: subagents (`task`) and read-only tools carry `readOnlyHint`, and a whole group Claude starts together reaches OpenCode in one step, so they run side by side (ported from upstream 1.1.0 and 1.2.1).
+- **Several Claude accounts**: the `accounts` option serves more subscriptions as extra providers, each signed in under its own `CLAUDE_CONFIG_DIR`; subagents follow their parent session's account.
+- **Tool images past a step limit**: screenshots still reach Claude when OpenCode ends a request with its `MAX_STEPS_PROMPT` message.
+- **Images and PDFs** returned by tools or pasted while a tool runs reach Claude.
+- **Mid-turn and queued messages** reach Claude; OpenCode is the only instruction source (no Claude Code settings, skills or memory); turns get OpenCode's tools only, with real schemas and the subagent list kept visible.
+- **Model discovery** backported from upstream 1.3.4: the account's catalog supplies model ids, names and effort choices.
+- **Quiet Esc-Esc**, cancellation and parked-turn cleanup, effort suppression on utility requests, Claude session reset after compaction.
+
+## 0.14.0 - 2026-08-19
+
+Last upstream release for OpenCode 1 (`@openchamber/opencode-claude`).
+
 ## 0.13.1 - 2026-08-18
 
 - **Fix: turn stall watchdog** — a Claude turn that went totally silent (dead
