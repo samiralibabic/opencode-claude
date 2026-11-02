@@ -1,10 +1,9 @@
 # opencode-claude
 
-[![GitHub stars](https://img.shields.io/github/stars/openchamber/opencode-claude?style=flat&labelColor=100F0F&color=66800B)](https://github.com/openchamber/opencode-claude/stargazers)
-[![GitHub release](https://img.shields.io/github/v/release/openchamber/opencode-claude?style=flat&labelColor=100F0F&color=205EA6)](https://github.com/openchamber/opencode-claude/releases/latest)
-[![npm](https://img.shields.io/npm/v/%40openchamber%2Fopencode-claude?style=flat&labelColor=100F0F&color=24837B)](https://www.npmjs.com/package/@openchamber/opencode-claude)
-[![Discord](https://img.shields.io/badge/Discord-join.svg?style=flat&labelColor=100F0F&color=8B7EC8&logo=discord&logoColor=FFFCF0)](https://discord.gg/ZYRSdnwwKA)
+[![npm](https://img.shields.io/npm/v/%40samiralibabic%2Fopencode-claude?style=flat&labelColor=100F0F&color=24837B)](https://www.npmjs.com/package/@samiralibabic/opencode-claude)
 [![License](https://img.shields.io/badge/license-MIT-black?style=flat&labelColor=100F0F&color=EC8B49)](LICENSE)
+
+> **A maintained fork for OpenCode 1.** [`@openchamber/opencode-claude`](https://github.com/openchamber/opencode-claude) requires OpenCode 2 since 1.0 and was archived on 2026-10-31, superseded by OpenCode's native Claude Code support (2.2.3 and later). This fork continues its last OpenCode 1 release, `0.14.0`, with backported and local fixes: model discovery, mid-turn messages, tool images and PDFs, several Claude accounts and parallel subagents ([changelog](CHANGELOG.md)). On OpenCode 2, use OpenCode's own Claude Code support instead.
 
 ## Claude Code in OpenCode. Local CLI auth. Agent SDK.
 
@@ -17,8 +16,6 @@ Use Claude from [OpenCode](https://opencode.ai) and [OpenChamber](https://github
 **Built on Anthropic's official Agent SDK and Claude Code authentication flow. Designed for local, user-operated Claude Code usage.**
 
 No OAuth tokens are extracted, copied, stored, injected, or sent by this plugin. All authentication and model access are performed internally by the official Claude Code runtime. The plugin does not call Anthropic inference endpoints directly and does not impersonate Anthropic API clients.
-
-Sibling plugins: [@openchamber/opencode-cursor](https://github.com/openchamber/opencode-cursor) and [@openchamber/opencode-commandcode](https://github.com/openchamber/opencode-commandcode).
 
 ![opencode-claude — Claude Code in OpenCode, local CLI auth, Agent SDK](docs/header.svg)
 
@@ -51,17 +48,17 @@ Subscription limit state is tracked with its reset time. `GET /v1/rate-limit` an
 ### 1. Install the plugin
 
 ```bash
-npm install -g @openchamber/opencode-claude
+npm install -g @samiralibabic/opencode-claude
 ```
 
 Or with OpenCode:
 
 ```bash
 # global (recommended)
-opencode plugin @openchamber/opencode-claude -g
+opencode plugin @samiralibabic/opencode-claude -g
 
 # or project-local (writes .opencode/opencode.json)
-opencode plugin @openchamber/opencode-claude
+opencode plugin @samiralibabic/opencode-claude
 ```
 
 ### 2. Register it in OpenCode
@@ -71,7 +68,7 @@ Add (or merge) this into `~/.config/opencode/opencode.json`:
 ```jsonc
 {
   "$schema": "https://opencode.ai/config.json",
-  "plugin": ["@openchamber/opencode-claude"],
+  "plugin": ["@samiralibabic/opencode-claude"],
   "provider": {
     "claude-code": { "name": "Claude Code" }
   }
@@ -98,7 +95,7 @@ In the TUI, pick provider **claude-code**, choose an account-advertised model, a
 ### From source (optional)
 
 ```bash
-git clone https://github.com/openchamber/opencode-claude.git
+git clone https://github.com/samiralibabic/opencode-claude.git
 cd opencode-claude
 bun install && bun run build
 opencode plugin file://$PWD
@@ -135,7 +132,7 @@ Each extra subscription becomes its own provider with the same models, signed in
    ```jsonc
    {
      "plugin": [
-       ["@openchamber/opencode-claude", {
+       ["@samiralibabic/opencode-claude", {
          "accounts": [{ "provider": "claude-code-2", "configDir": "~/.claude-2" }]
        }]
      ]
@@ -180,7 +177,7 @@ The proxy records Agent SDK `rate_limit_event` telemetry and hard session-limit 
 
 ## Requirements
 
-- [OpenCode](https://opencode.ai)
+- [OpenCode](https://opencode.ai) 1.x (`>=1.18.15 <2`)
 - [Claude Code CLI](https://docs.anthropic.com/en/docs/claude-code) — on `PATH` or installed via the provider's install action (npm is used, or the official install script); the plugin also checks `~/.local/bin` and the npm global bin for a CLI the server PATH cannot see
 - Claude plan supported by Claude Code
 - Bun (plugin runtime) · Node.js ≥ 18
@@ -207,8 +204,8 @@ Optional knobs:
 
 | Symptom | Fix |
 | --- | --- |
-| Unknown provider `claude-code` | Install `@openchamber/opencode-claude` and restart OpenCode |
-| Claude Code missing from provider list | Confirm `plugin` includes `@openchamber/opencode-claude` and restart OpenCode |
+| Unknown provider `claude-code` | Install `@samiralibabic/opencode-claude` and restart OpenCode |
+| Claude Code missing from provider list | Confirm `plugin` includes `@samiralibabic/opencode-claude` and restart OpenCode |
 | Authentication error | Run `claude auth login`, verify `claude auth status --json`, then restart OpenCode |
 | 429 / rate-limit | Poll `GET /v1/rate-limit` or wait until `resetsAt`; the next turn resumes the same session |
 | Tools hang or invent output | Update to the latest plugin — park/resume MCP bridging is required |
@@ -216,26 +213,11 @@ Optional knobs:
 
 ## Release
 
-Publish via GitHub Actions → **Actions → Release → Run workflow**:
-
-| Input | Purpose |
-| --- | --- |
-| `version` | Explicit semver (`0.6.0`). Empty → use bump |
-| `bump` | `minor` (default) / `patch` / `major` |
-| `dry_run` | Skip npm publish; create a draft GitHub release |
-
-Requires repo secrets: `NPM_TOKEN`, optional `DISCORD_WEBHOOK_URL`.
-
-Local pin refresh after a release:
-
-```bash
-./scripts/update-plugin.sh --dry-run
-./scripts/update-plugin.sh
-```
+Releases are published from GitHub Actions when a `v<version>` tag is pushed, through npm Trusted Publishing with provenance; see [RELEASING.md](RELEASING.md).
 
 ## Contributing
 
-Issues and pull requests belong in this repository: [openchamber/opencode-claude](https://github.com/openchamber/opencode-claude).
+Issues and pull requests belong in this repository: [samiralibabic/opencode-claude](https://github.com/samiralibabic/opencode-claude). The original project, [openchamber/opencode-claude](https://github.com/openchamber/opencode-claude), is archived.
 
 ```bash
 bun install
@@ -245,7 +227,7 @@ bun run test
 
 ## Acknowledgments
 
-This plugin started as community work around Claude Code in OpenCode. Special thanks to:
+This plugin started as community work around Claude Code in OpenCode, published as [`@openchamber/opencode-claude`](https://github.com/openchamber/opencode-claude); this fork continues its `0.14.0` release. Special thanks to:
 
 - [OpenCode](https://opencode.ai) for the plugin API
 - [OpenChamber](https://github.com/openchamber/openchamber) for the workspace that runs this plugin in production
