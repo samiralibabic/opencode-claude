@@ -119,6 +119,34 @@ export const PROXY_IDLE_TIMEOUT_SECONDS = 0;
 export const SSE_HEARTBEAT_MS = 5_000;
 
 /**
+ * A parked turn waits for the assistant message to close so that every tool
+ * call of that message reaches OpenCode in one response (see
+ * PARALLEL_SAFE_TOOLS). This much silence from the CLI ends the wait.
+ */
+const PARK_QUIET_MS = 3_000;
+
+/**
+ * The CLI starts a message's tool calls only after message_stop, a few
+ * microseconds apart. Once the message is closed, wait this long at most
+ * for the rest of the group it announced before handing off what arrived.
+ */
+const PARK_SETTLE_MS = 300;
+
+/**
+ * How many calls the CLI starts together for a message whose tool_use
+ * blocks are `names`: the leading run of readOnlyHint tools, or the first
+ * call alone when it is not one of them.
+ */
+export function expectedParallelGroup(names: string[]): number {
+  let run = 0;
+  for (const name of names) {
+    if (!PARALLEL_SAFE_TOOLS.has(name)) break;
+    run += 1;
+  }
+  return Math.max(1, run);
+}
+
+/**
  * Optional pinned port via OPENCODE_CLAUDE_PROXY_PORT.
  * Default is `0` — Bun binds an ephemeral free port; the live URL is then
  * published through the config hook so OpenCode always hits the
@@ -647,6 +675,49 @@ async function handleChatCompletions(
   let handle: ClaudeQueryHandle | null = null;
   let parked = false;
   let parkWaiters: Array<() => void> = [];
+  // The assistant message is still streaming: sibling tool calls may follow
+  // the one that parked, so the park is held until the message closes.
+  let messageOpen = false;
+  // next() that was in flight when the turn parked; consumed on resume so
+  // the event it carries is not lost.
+  let pendingNext: Promise<IteratorResult<unknown>> | null = null;
+  // OpenCode tool names of the tool_use blocks in the current message.
+  let messageToolNames: string[] = [];
+
+  const trackMessageState = (event: unknown) => {
+    if (!event || typeof event !== "object") return;
+    const e = event as Record<string, unknown>;
+    // Only the stream's message_stop closes the message: the CLI emits an
+    // `assistant` event after every content block, not once per message.
+    if (e.type === "stream_event" && e.event && typeof e.event === "object") {
+      const ev = e.event as {
+        type?: unknown;
+        content_block?: { type?: unknown; name?: unknown };
+      };
+      if (ev.type === "message_start") {
+        messageOpen = true;
+        messageToolNames = [];
+      }
+      if (ev.type === "message_stop") messageOpen = false;
+      if (
+        ev.type === "content_block_start" &&
+        ev.content_block?.type === "tool_use" &&
+        typeof ev.content_block.name === "string"
+      ) {
+        messageToolNames.push(ev.content_block.name.replace(/^mcp__opencode__/, ""));
+      }
+    }
+  };
+
+  // Keep a next() for the resumed turn, and never let it reject unobserved
+  // if the turn is torn down instead.
+  const keepPendingNext = (next: Promise<IteratorResult<unknown>>) => {
+    next.then(
+      () => {},
+      () => {},
+    );
+    pendingNext = next;
+  };
 
   const notifyPark = () => {
     parked = true;
@@ -905,21 +976,55 @@ async function handleChatCompletions(
 
   async function* consumeStream(): AsyncGenerator<unknown, void, unknown> {
     const iterator = handle!.stream[Symbol.asyncIterator]();
+    // Set once the calls are handed to OpenCode. A stream that ends or fails
+    // while a park is still held is a dead turn, not a parked one.
+    let handedOff = false;
+    // The settle window ran out: hand off whatever the group has.
+    let settled = false;
     try {
       while (true) {
+        // Parked and the message is closed: hand every collected call to
+        // OpenCode in one response. Claude Code already grouped the calls it
+        // may run side by side (readOnlyHint ones); here they are only
+        // forwarded, and OpenCode runs one response's calls concurrently.
+        // Hand off once the CLI has started the whole group it runs
+        // together, or when the settle window below runs out.
+        const holding = parked && pendingTools.size > 0;
+        if (
+          holding &&
+          !messageOpen &&
+          (settled || pendingTools.size >= expectedParallelGroup(messageToolNames))
+        ) {
+          settled = false;
+          handedOff = true;
+          if (pendingTools.size > 1) {
+            log.info("[opencode-claude] handing off parallel tool calls", {
+              conversationKey,
+              tools: [...pendingTools.values()].map((tool) => tool.name),
+            });
+          }
+          yield { type: "__park__", tools: [...pendingTools.values()] };
+          return;
+        }
         const parkControl = {
           cancel: null as (() => void) | null,
         };
+        // Every registration wakes the loop: the first parks the turn, later
+        // ones may complete the group being held.
         const parkPromise = new Promise<void>((resolve) => {
-          if (parked && pendingTools.size > 0) {
-            resolve();
-            return;
-          }
           const entry = () => resolve();
           parkWaiters.push(entry);
           parkControl.cancel = () => {
             parkWaiters = parkWaiters.filter((w) => w !== entry);
           };
+        });
+        // Holding: an open message that goes quiet will not close by itself;
+        // a closed one only needs a moment for its sibling calls to start.
+        let quietTimer: ReturnType<typeof setTimeout> | null = null;
+        const quietPromise = new Promise<void>((resolve) => {
+          if (!holding) return;
+          quietTimer = setTimeout(resolve, messageOpen ? PARK_QUIET_MS : PARK_SETTLE_MS);
+          quietTimer.unref?.();
         });
 
         // Watchdog: total silence from the CLI (dead process, stuck compact,
@@ -942,14 +1047,17 @@ async function handleChatCompletions(
           stallTimer.unref?.();
         });
 
-        const nextPromise = iterator.next();
+        const nextPromise = pendingNext ?? iterator.next();
+        pendingNext = null;
         let raced:
           | { kind: "event"; value: IteratorResult<unknown> }
-          | { kind: "park" };
+          | { kind: "park" }
+          | { kind: "quiet" };
         try {
           raced = await Promise.race([
             nextPromise.then((value) => ({ kind: "event" as const, value })),
             parkPromise.then(() => ({ kind: "park" as const })),
+            quietPromise.then(() => ({ kind: "quiet" as const })),
             stallPromise,
           ]);
         } catch (error) {
@@ -963,34 +1071,24 @@ async function handleChatCompletions(
           throw error;
         } finally {
           if (stallTimer) clearTimeout(stallTimer);
-        }
-
-        if (raced.kind === "park" || (parked && pendingTools.size > 0)) {
-          parkControl.cancel?.();
-          await Promise.resolve();
-          // The iterator's pending next() may already have consumed the
-          // assistant event that carries the parked tool call (and its
-          // per-call usage). Forward it before parking so usage accounting
-          // and session binding stay intact.
-          if (raced.kind === "event" && !raced.value.done) {
-            const pendingEvent = raced.value.value;
-            const pendingSessionId = extractSessionId(pendingEvent);
-            if (pendingSessionId && !isMetaRequest) {
-              setForeignSessionId(conversationKey, pendingSessionId, {
-                modelId: model,
-                cwd,
-                account: account.provider,
-              });
-            }
-            yield pendingEvent;
-          }
-          yield { type: "__park__", tools: [...pendingTools.values()] };
-          return;
+          if (quietTimer) clearTimeout(quietTimer);
         }
 
         parkControl.cancel?.();
+        if (raced.kind === "park") {
+          // Keep the in-flight next(); the loop top decides whether to hold.
+          keepPendingNext(nextPromise);
+          continue;
+        }
+        if (raced.kind === "quiet") {
+          keepPendingNext(nextPromise);
+          if (!messageOpen) settled = true;
+          messageOpen = false;
+          continue;
+        }
         if (raced.value.done) break;
         const event = raced.value.value;
+        trackMessageState(event);
         const sessionId = extractSessionId(event);
         if (sessionId && !isMetaRequest) {
           setForeignSessionId(conversationKey, sessionId, {
@@ -1025,7 +1123,7 @@ async function handleChatCompletions(
         yield event;
       }
     } finally {
-      if (!parked) {
+      if (!handedOff) {
         handle?.close();
         deleteBridge(bridgeId);
       }
@@ -1122,6 +1220,33 @@ export function normalizeToolParameters(
   return { type: "object", properties: {} };
 }
 
+/**
+ * OpenCode tools annotated `readOnlyHint: true` for Claude Code. The CLI runs
+ * MCP tool calls one at a time unless the tool carries that annotation;
+ * annotated calls that sit next to each other in one assistant message form
+ * a group the CLI starts together (a non-annotated call in between splits
+ * the group). The proxy forwards what the CLI started within one message as
+ * one response, and OpenCode runs those calls side by side.
+ * The subagent tools (`subagent` on V2, `task` on V1) are listed on purpose
+ * so subagents run in parallel, like Claude Code's own Agent tool. Tools that
+ * write (edit, write, patch, shell, ...) must stay out.
+ */
+const PARALLEL_SAFE_TOOLS = new Set([
+  "read",
+  "glob",
+  "grep",
+  "list",
+  "codesearch",
+  "webfetch",
+  "websearch",
+  "todoread",
+  "skill",
+  "lsp_diagnostics",
+  "lsp_hover",
+  "task",
+  "subagent",
+]);
+
 async function buildOpenCodeMcpServer(
   tools: OpenAITool[],
   pendingTools: Map<string, ParkedToolCall>,
@@ -1180,6 +1305,7 @@ async function buildOpenCodeMcpServer(
       name: string;
       description: string;
       inputSchema: Record<string, unknown>;
+      annotations?: { readOnlyHint: true };
       _meta: Record<string, unknown>;
     }> = [];
     const mcpTools = tools
@@ -1188,10 +1314,14 @@ async function buildOpenCodeMcpServer(
         if (!name) return null;
         const description = fitToolDescription(t.function?.description || name);
         const params = normalizeToolParameters(t.function?.parameters);
+        const annotations = PARALLEL_SAFE_TOOLS.has(name)
+          ? { readOnlyHint: true as const }
+          : undefined;
         listed.push({
           name,
           description,
           inputSchema: params,
+          ...(annotations ? { annotations } : {}),
           _meta: { "anthropic/alwaysLoad": true },
         });
         let shape: unknown;
@@ -1232,7 +1362,7 @@ async function buildOpenCodeMcpServer(
               content: result.length > 0 ? result : [{ type: "text", text: "" }],
             };
           },
-          { alwaysLoad: true },
+          { alwaysLoad: true, ...(annotations ? { annotations } : {}) },
         );
       })
       .filter(Boolean);
