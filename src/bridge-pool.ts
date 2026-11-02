@@ -2,6 +2,7 @@
  * Parked Claude Agent SDK turns waiting for OpenCode tool results
  * (Cursor bridge-pool pattern).
  */
+import type { ClaudeAccount } from "./accounts.js";
 import type { AnthropicContentBlock, McpToolResultContent } from "./prompt.js";
 import type { ClaudeQueryHandle } from "./query.js";
 
@@ -16,6 +17,8 @@ export type ParkedToolCall = {
 export type ParkedBridge = {
   id: string;
   conversationKey: string;
+  /** Claude account the turn runs on; its limits and errors are this account's. */
+  account: ClaudeAccount;
   handle: ClaudeQueryHandle;
   pendingTools: Map<string, ParkedToolCall>;
   /** SDK assistant messages whose usage was already reported to OpenCode. */

@@ -18,12 +18,20 @@ import {
   type ParkedBridge,
   type ParkedToolCall,
 } from "./bridge-pool.js";
-import { buildClaudeCodeChildEnv } from "./auth-env.js";
+import {
+  accountConfigDir,
+  accountEnv,
+  defaultAccount,
+  findAccount,
+  getAccounts,
+  type ClaudeAccount,
+} from "./accounts.js";
 import {
   classifyClaudeFailure,
   failureHintFor,
   failureStatusFor,
   failureTypeFor,
+  withAccountSwitchHint,
 } from "./failure.js";
 import {
   decodeClaudeModelSelection,
@@ -31,6 +39,7 @@ import {
 } from "./model-selection.js";
 import { resolveClaudeModelId } from "./models.js";
 import {
+  ACCOUNT_HEADER,
   DIRECTORY_HEADER,
   SESSION_HEADER,
   type ClaudeEffort,
@@ -40,7 +49,7 @@ import {
   clearForeignSessionId,
   conversationKeyFromMessages,
   findClaudeSessionFile,
-  getForeignSessionId,
+  getSessionBinding,
   setForeignSessionId,
 } from "./session-store.js";
 import { log } from "./log.js";
@@ -108,6 +117,34 @@ function turnStallMs(): number {
  */
 export const PROXY_IDLE_TIMEOUT_SECONDS = 0;
 export const SSE_HEARTBEAT_MS = 5_000;
+
+/**
+ * A parked turn waits for the assistant message to close so that every tool
+ * call of that message reaches OpenCode in one response (see
+ * PARALLEL_SAFE_TOOLS). This much silence from the CLI ends the wait.
+ */
+const PARK_QUIET_MS = 3_000;
+
+/**
+ * The CLI starts a message's tool calls only after message_stop, a few
+ * microseconds apart. Once the message is closed, wait this long at most
+ * for the rest of the group it announced before handing off what arrived.
+ */
+const PARK_SETTLE_MS = 300;
+
+/**
+ * How many calls the CLI starts together for a message whose tool_use
+ * blocks are `names`: the leading run of readOnlyHint tools, or the first
+ * call alone when it is not one of them.
+ */
+export function expectedParallelGroup(names: string[]): number {
+  let run = 0;
+  for (const name of names) {
+    if (!PARALLEL_SAFE_TOOLS.has(name)) break;
+    run += 1;
+  }
+  return Math.max(1, run);
+}
 
 /**
  * Optional pinned port via OPENCODE_CLAUDE_PROXY_PORT.
@@ -279,11 +316,23 @@ export async function stopProxy(): Promise<void> {
 async function handleRequest(req: Request): Promise<Response> {
   const url = new URL(req.url);
 
+  // `?account=<provider>` selects which Claude account the counters describe.
+  const queriedAccount = url.searchParams.get("account");
+  const statusAccount = queriedAccount ? findAccount(queriedAccount) : defaultAccount();
+  if (
+    req.method === "GET" &&
+    !statusAccount &&
+    /^\/(?:v1\/)?(?:health|rate-limit)$/.test(url.pathname)
+  ) {
+    return unknownAccountResponse(queriedAccount!);
+  }
+
   if (req.method === "GET" && (url.pathname === "/health" || url.pathname === "/v1/health")) {
-    const rateLimit = getRateLimitSnapshot();
+    const rateLimit = getRateLimitSnapshot(Date.now(), statusAccount!.provider);
     return Response.json({
       ok: true,
-      provider: "claude-code",
+      provider: statusAccount!.provider,
+      accounts: getAccounts().map((account) => account.provider),
       rateLimit: {
         limited: rateLimit.limited,
         ...(rateLimit.resetsAtISO ? { resetsAt: rateLimit.resetsAtISO } : {}),
@@ -302,7 +351,7 @@ async function handleRequest(req: Request): Promise<Response> {
     req.method === "GET" &&
     (url.pathname === "/rate-limit" || url.pathname === "/v1/rate-limit")
   ) {
-    return Response.json(getRateLimitSnapshot());
+    return Response.json(getRateLimitSnapshot(Date.now(), statusAccount!.provider));
   }
 
   if (req.method === "GET" && url.pathname === "/v1/models") {
@@ -480,6 +529,11 @@ async function handleChatCompletions(
   const selection = selectionFromRequest(req, body);
   const model = resolveClaudeModelId(selection.modelId);
   const stream = body.stream !== false;
+  // Requests without the header (direct API callers) run on the default account.
+  const accountHeader = req.headers.get(ACCOUNT_HEADER)?.trim();
+  const requestedAccount = accountHeader ? findAccount(accountHeader) : defaultAccount();
+  if (!requestedAccount) return unknownAccountResponse(accountHeader!);
+  const account: ClaudeAccount = requestedAccount;
 
   // Resume a parked bridge if OpenCode returned tool results.
   const toolResults = collectToolResults(messages);
@@ -493,6 +547,25 @@ async function handleChatCompletions(
         break;
       }
     }
+  }
+  // The session moved to another account while a turn was open (a message
+  // queued after a model-picker switch): never let the old account finish
+  // it. End that turn and start a new one on the requested account. Its
+  // Claude session holds a tool call that never got a result, so this turn
+  // transfers OpenCode's history — with the finished tool results — instead
+  // of resuming it.
+  const movedMidTurn = !!existing && existing.account.provider !== account.provider;
+  if (existing && movedMidTurn) {
+    log.info("[opencode-claude] session moved to another Claude account mid-turn; restarting the turn there", {
+      conversationKey,
+      from: existing.account.provider,
+      to: account.provider,
+    });
+    abandonBridge(existing.id);
+    // Even if this request starts no turn (limit gate, early failure), no
+    // later turn may resume the abandoned session without its tool result.
+    clearForeignSessionId(conversationKey);
+    existing = undefined;
   }
   if (existing && existing.pendingTools.size > 0) {
     let resolved = 0;
@@ -582,6 +655,7 @@ async function handleChatCompletions(
   log.info("[opencode-claude] chat completions", {
     conversationKey,
     sessionHeader,
+    account: account.provider,
     metaKind,
     toolCount: Array.isArray(body.tools) ? body.tools.length : 0,
     messageCount: messages.length,
@@ -589,7 +663,7 @@ async function handleChatCompletions(
     bridgePending: existing?.pendingTools.size ?? 0,
   });
 
-  const env = buildClaudeCodeChildEnv();
+  const env = accountEnv(account);
 
   const openCodeTools = Array.isArray(body.tools) ? body.tools : [];
   const isMetaRequest = metaKind !== null;
@@ -601,6 +675,49 @@ async function handleChatCompletions(
   let handle: ClaudeQueryHandle | null = null;
   let parked = false;
   let parkWaiters: Array<() => void> = [];
+  // The assistant message is still streaming: sibling tool calls may follow
+  // the one that parked, so the park is held until the message closes.
+  let messageOpen = false;
+  // next() that was in flight when the turn parked; consumed on resume so
+  // the event it carries is not lost.
+  let pendingNext: Promise<IteratorResult<unknown>> | null = null;
+  // OpenCode tool names of the tool_use blocks in the current message.
+  let messageToolNames: string[] = [];
+
+  const trackMessageState = (event: unknown) => {
+    if (!event || typeof event !== "object") return;
+    const e = event as Record<string, unknown>;
+    // Only the stream's message_stop closes the message: the CLI emits an
+    // `assistant` event after every content block, not once per message.
+    if (e.type === "stream_event" && e.event && typeof e.event === "object") {
+      const ev = e.event as {
+        type?: unknown;
+        content_block?: { type?: unknown; name?: unknown };
+      };
+      if (ev.type === "message_start") {
+        messageOpen = true;
+        messageToolNames = [];
+      }
+      if (ev.type === "message_stop") messageOpen = false;
+      if (
+        ev.type === "content_block_start" &&
+        ev.content_block?.type === "tool_use" &&
+        typeof ev.content_block.name === "string"
+      ) {
+        messageToolNames.push(ev.content_block.name.replace(/^mcp__opencode__/, ""));
+      }
+    }
+  };
+
+  // Keep a next() for the resumed turn, and never let it reject unobserved
+  // if the turn is torn down instead.
+  const keepPendingNext = (next: Promise<IteratorResult<unknown>>) => {
+    next.then(
+      () => {},
+      () => {},
+    );
+    pendingNext = next;
+  };
 
   const notifyPark = () => {
     parked = true;
@@ -643,16 +760,17 @@ async function handleChatCompletions(
   // Retry-After instead of spawning a doomed Agent SDK turn (which would
   // surface as a fake "completed" assistant message and burn time).
   // Placed after input validation so malformed requests still get 400.
-  const gate = rateLimitGate();
+  const gate = rateLimitGate(Date.now(), account.provider);
   if (gate.blocked) {
     log.warn("[opencode-claude] rate-limit gate blocked a turn", {
       conversationKey,
+      account: account.provider,
       retryAfterSeconds: gate.retryAfterSeconds,
     });
     return Response.json(
       {
         error: {
-          message: gate.message,
+          message: withAccountSwitchHint(gate.message, account),
           type: "rate_limit_error",
           code: "claude_session_limit",
           ...(gate.resetsAt !== undefined
@@ -673,18 +791,28 @@ async function handleChatCompletions(
     );
   }
 
-  let resume = isMetaRequest ? undefined : getForeignSessionId(conversationKey);
-  if (resume && !findClaudeSessionFile(resume)) {
+  const binding = isMetaRequest ? undefined : getSessionBinding(conversationKey);
+  let resume = movedMidTurn ? undefined : binding?.foreignSessionId;
+  if (resume && !findClaudeSessionFile(resume, accountConfigDir(account))) {
     // The claude CLI resumes from the transcript on disk. When no projects
-    // folder has it (cleanup, different machine, pruned projects dir), the CLI
-    // would fail the turn with "No conversation found" — drop the stale
-    // binding and transfer the conversation history into the prompt instead.
+    // folder has it (cleanup, different machine, pruned projects dir, or an
+    // account that keeps its own session history), the CLI would fail the
+    // turn with "No conversation found" — drop the stale binding and
+    // transfer the conversation history into the prompt instead.
     log.warn("[opencode-claude] stored Claude session file missing; transferring history", {
       conversationKey,
       foreignSessionId: resume,
+      account: account.provider,
     });
     clearForeignSessionId(conversationKey);
     resume = undefined;
+  } else if (resume && binding?.account && binding.account !== account.provider) {
+    log.info("[opencode-claude] conversation moved to another Claude account; resuming its Claude session", {
+      conversationKey,
+      foreignSessionId: resume,
+      from: binding.account,
+      to: account.provider,
+    });
   }
 
   // No resumable Claude session (first claude-code turn of this chat, model
@@ -835,6 +963,7 @@ async function handleChatCompletions(
   const bridge: ParkedBridge = {
     id: bridgeId,
     conversationKey,
+    account,
     handle,
     pendingTools,
     seenAssistantUsageIds: new Set(),
@@ -847,21 +976,55 @@ async function handleChatCompletions(
 
   async function* consumeStream(): AsyncGenerator<unknown, void, unknown> {
     const iterator = handle!.stream[Symbol.asyncIterator]();
+    // Set once the calls are handed to OpenCode. A stream that ends or fails
+    // while a park is still held is a dead turn, not a parked one.
+    let handedOff = false;
+    // The settle window ran out: hand off whatever the group has.
+    let settled = false;
     try {
       while (true) {
+        // Parked and the message is closed: hand every collected call to
+        // OpenCode in one response. Claude Code already grouped the calls it
+        // may run side by side (readOnlyHint ones); here they are only
+        // forwarded, and OpenCode runs one response's calls concurrently.
+        // Hand off once the CLI has started the whole group it runs
+        // together, or when the settle window below runs out.
+        const holding = parked && pendingTools.size > 0;
+        if (
+          holding &&
+          !messageOpen &&
+          (settled || pendingTools.size >= expectedParallelGroup(messageToolNames))
+        ) {
+          settled = false;
+          handedOff = true;
+          if (pendingTools.size > 1) {
+            log.info("[opencode-claude] handing off parallel tool calls", {
+              conversationKey,
+              tools: [...pendingTools.values()].map((tool) => tool.name),
+            });
+          }
+          yield { type: "__park__", tools: [...pendingTools.values()] };
+          return;
+        }
         const parkControl = {
           cancel: null as (() => void) | null,
         };
+        // Every registration wakes the loop: the first parks the turn, later
+        // ones may complete the group being held.
         const parkPromise = new Promise<void>((resolve) => {
-          if (parked && pendingTools.size > 0) {
-            resolve();
-            return;
-          }
           const entry = () => resolve();
           parkWaiters.push(entry);
           parkControl.cancel = () => {
             parkWaiters = parkWaiters.filter((w) => w !== entry);
           };
+        });
+        // Holding: an open message that goes quiet will not close by itself;
+        // a closed one only needs a moment for its sibling calls to start.
+        let quietTimer: ReturnType<typeof setTimeout> | null = null;
+        const quietPromise = new Promise<void>((resolve) => {
+          if (!holding) return;
+          quietTimer = setTimeout(resolve, messageOpen ? PARK_QUIET_MS : PARK_SETTLE_MS);
+          quietTimer.unref?.();
         });
 
         // Watchdog: total silence from the CLI (dead process, stuck compact,
@@ -884,14 +1047,17 @@ async function handleChatCompletions(
           stallTimer.unref?.();
         });
 
-        const nextPromise = iterator.next();
+        const nextPromise = pendingNext ?? iterator.next();
+        pendingNext = null;
         let raced:
           | { kind: "event"; value: IteratorResult<unknown> }
-          | { kind: "park" };
+          | { kind: "park" }
+          | { kind: "quiet" };
         try {
           raced = await Promise.race([
             nextPromise.then((value) => ({ kind: "event" as const, value })),
             parkPromise.then(() => ({ kind: "park" as const })),
+            quietPromise.then(() => ({ kind: "quiet" as const })),
             stallPromise,
           ]);
         } catch (error) {
@@ -905,38 +1071,30 @@ async function handleChatCompletions(
           throw error;
         } finally {
           if (stallTimer) clearTimeout(stallTimer);
-        }
-
-        if (raced.kind === "park" || (parked && pendingTools.size > 0)) {
-          parkControl.cancel?.();
-          await Promise.resolve();
-          // The iterator's pending next() may already have consumed the
-          // assistant event that carries the parked tool call (and its
-          // per-call usage). Forward it before parking so usage accounting
-          // and session binding stay intact.
-          if (raced.kind === "event" && !raced.value.done) {
-            const pendingEvent = raced.value.value;
-            const pendingSessionId = extractSessionId(pendingEvent);
-            if (pendingSessionId && !isMetaRequest) {
-              setForeignSessionId(conversationKey, pendingSessionId, {
-                modelId: model,
-                cwd,
-              });
-            }
-            yield pendingEvent;
-          }
-          yield { type: "__park__", tools: [...pendingTools.values()] };
-          return;
+          if (quietTimer) clearTimeout(quietTimer);
         }
 
         parkControl.cancel?.();
+        if (raced.kind === "park") {
+          // Keep the in-flight next(); the loop top decides whether to hold.
+          keepPendingNext(nextPromise);
+          continue;
+        }
+        if (raced.kind === "quiet") {
+          keepPendingNext(nextPromise);
+          if (!messageOpen) settled = true;
+          messageOpen = false;
+          continue;
+        }
         if (raced.value.done) break;
         const event = raced.value.value;
+        trackMessageState(event);
         const sessionId = extractSessionId(event);
         if (sessionId && !isMetaRequest) {
           setForeignSessionId(conversationKey, sessionId, {
             modelId: model,
             cwd,
+            account: account.provider,
           });
         }
         if (isResultEvent(event) && promptChannel) {
@@ -965,7 +1123,7 @@ async function handleChatCompletions(
         yield event;
       }
     } finally {
-      if (!parked) {
+      if (!handedOff) {
         handle?.close();
         deleteBridge(bridgeId);
       }
@@ -991,7 +1149,7 @@ async function handleChatCompletions(
       if (bridge.abandoned || req.signal.aborted) {
         return cancelledResponse(conversationKey);
       }
-      return failureResponse(probe.errorText, conversationKey);
+      return failureResponse(probe.errorText, conversationKey, account);
     }
     return streamOpenAIResponse(probe.replay, body.model || model, bridge);
   }
@@ -1062,6 +1220,33 @@ export function normalizeToolParameters(
   return { type: "object", properties: {} };
 }
 
+/**
+ * OpenCode tools annotated `readOnlyHint: true` for Claude Code. The CLI runs
+ * MCP tool calls one at a time unless the tool carries that annotation;
+ * annotated calls that sit next to each other in one assistant message form
+ * a group the CLI starts together (a non-annotated call in between splits
+ * the group). The proxy forwards what the CLI started within one message as
+ * one response, and OpenCode runs those calls side by side.
+ * The subagent tools (`subagent` on V2, `task` on V1) are listed on purpose
+ * so subagents run in parallel, like Claude Code's own Agent tool. Tools that
+ * write (edit, write, patch, shell, ...) must stay out.
+ */
+const PARALLEL_SAFE_TOOLS = new Set([
+  "read",
+  "glob",
+  "grep",
+  "list",
+  "codesearch",
+  "webfetch",
+  "websearch",
+  "todoread",
+  "skill",
+  "lsp_diagnostics",
+  "lsp_hover",
+  "task",
+  "subagent",
+]);
+
 async function buildOpenCodeMcpServer(
   tools: OpenAITool[],
   pendingTools: Map<string, ParkedToolCall>,
@@ -1120,6 +1305,7 @@ async function buildOpenCodeMcpServer(
       name: string;
       description: string;
       inputSchema: Record<string, unknown>;
+      annotations?: { readOnlyHint: true };
       _meta: Record<string, unknown>;
     }> = [];
     const mcpTools = tools
@@ -1128,10 +1314,14 @@ async function buildOpenCodeMcpServer(
         if (!name) return null;
         const description = fitToolDescription(t.function?.description || name);
         const params = normalizeToolParameters(t.function?.parameters);
+        const annotations = PARALLEL_SAFE_TOOLS.has(name)
+          ? { readOnlyHint: true as const }
+          : undefined;
         listed.push({
           name,
           description,
           inputSchema: params,
+          ...(annotations ? { annotations } : {}),
           _meta: { "anthropic/alwaysLoad": true },
         });
         let shape: unknown;
@@ -1172,7 +1362,7 @@ async function buildOpenCodeMcpServer(
               content: result.length > 0 ? result : [{ type: "text", text: "" }],
             };
           },
-          { alwaysLoad: true },
+          { alwaysLoad: true, ...(annotations ? { annotations } : {}) },
         );
       })
       .filter(Boolean);
@@ -1240,7 +1430,7 @@ async function collectTurnResponse(
 
   try {
     for await (const event of events) {
-      const mapped = mapSdkEvent(event);
+      const mapped = mapSdkEvent(event, bridge.account);
       if (mapped.kind === "park") {
         toolCalls.push(...mapped.tools);
         sawContent = true;
@@ -1268,7 +1458,7 @@ async function collectTurnResponse(
     }
   } catch (err) {
     const message = err instanceof Error ? err.message : String(err);
-    recordRateLimitErrorText(message);
+    recordRateLimitErrorText(message, bridge.account.provider);
     forgetDeadSession(bridge.conversationKey, message);
     noteError(message);
   }
@@ -1283,7 +1473,7 @@ async function collectTurnResponse(
     (!sawContent || classifyClaudeFailure(errorText) === "rate_limit")
   ) {
     if (bridge.abandoned) return cancelledResponse(bridge.conversationKey);
-    return failureResponse(errorText, bridge.conversationKey);
+    return failureResponse(errorText, bridge.conversationKey, bridge.account);
   }
 
   return Response.json({
@@ -1447,6 +1637,22 @@ function cancelledResponse(conversationKey: string): Response {
   );
 }
 
+/** A request names a Claude account this plugin does not serve. */
+function unknownAccountResponse(provider: string): Response {
+  return Response.json(
+    {
+      error: {
+        message: `Unknown Claude account "${provider}". Configured accounts: ${getAccounts()
+          .map((account) => account.provider)
+          .join(", ")} — check the opencode-claude plugin's \`accounts\` option.`,
+        type: "invalid_request_error",
+        code: "claude_unknown_account",
+      },
+    },
+    { status: 400 },
+  );
+}
+
 /**
  * Truthful HTTP error for a turn that died before producing content.
  * Also records hard subscription limits so the fast-fail gate activates and
@@ -1455,29 +1661,34 @@ function cancelledResponse(conversationKey: string): Response {
 function failureResponse(
   errorText: string,
   conversationKey: string,
+  account: ClaudeAccount,
 ): Response {
-  recordRateLimitErrorText(errorText);
+  recordRateLimitErrorText(errorText, account.provider);
   forgetDeadSession(conversationKey, errorText);
   const kind = classifyClaudeFailure(errorText);
   log.warn("[opencode-claude] turn failed fast", {
     kind,
     conversationKey,
+    account: account.provider,
     message: errorText.slice(0, 300),
   });
 
   if (kind === "rate_limit") {
-    const snap = getRateLimitSnapshot();
+    const snap = getRateLimitSnapshot(Date.now(), account.provider);
     const until = snap.limitedUntil ?? snap.resetsAt;
     const retryAfterSeconds =
       until !== undefined
         ? Math.max(1, Math.round((until - Date.now()) / 1000))
         : 600;
     const countdown = formatResetCountdown(retryAfterSeconds * 1000);
-    const message = /\blimit resets in\b/i.test(errorText)
-      ? errorText
-      : `${errorText} · limit resets in ${countdown}${
-          snap.resetsAtISO ? ` (${snap.resetsAtISO})` : ""
-        }`;
+    const message = withAccountSwitchHint(
+      /\blimit resets in\b/i.test(errorText)
+        ? errorText
+        : `${errorText} · limit resets in ${countdown}${
+            snap.resetsAtISO ? ` (${snap.resetsAtISO})` : ""
+          }`,
+      account,
+    );
     return Response.json(
       {
         error: {
@@ -1506,7 +1717,7 @@ function failureResponse(
     );
   }
 
-  const hint = failureHintFor(kind);
+  const hint = failureHintFor(kind, account);
   return Response.json(
     {
       error: {
@@ -1617,7 +1828,7 @@ function streamOpenAIResponse(
 
       try {
         for await (const event of events) {
-          const mapped = mapSdkEvent(event);
+          const mapped = mapSdkEvent(event, bridge.account);
           if (mapped.kind === "park") {
             finishReason = "tool_calls";
             for (let i = 0; i < mapped.tools.length; i++) {
@@ -1713,7 +1924,7 @@ function streamOpenAIResponse(
         const message = err instanceof Error ? err.message : String(err);
         // A limit/result failure typically arrives here right after the SDK
         // emitted the same text as a result event — dedupe via sendError.
-        recordRateLimitErrorText(message);
+        recordRateLimitErrorText(message, bridge.account.provider);
         forgetDeadSession(bridge.conversationKey, message);
         log.warn("[opencode-claude] stream iterator failed", {
           conversationKey: bridge.conversationKey,
@@ -1811,8 +2022,11 @@ function forgetDeadSession(conversationKey: string, errorText: string): void {
  * Prefer `stream_event` content_block_delta for text/reasoning. Full
  * `assistant` message payloads repeat the same content after partials and
  * would double-print if both were forwarded.
+ *
+ * Limit telemetry and limit errors are recorded for `account`, the Claude
+ * account the turn runs on.
  */
-function mapSdkEvent(event: unknown): MappedEvent {
+function mapSdkEvent(event: unknown, account: ClaudeAccount): MappedEvent {
   if (!event || typeof event !== "object") return { kind: "ignore" };
   const e = event as Record<string, unknown>;
 
@@ -1829,8 +2043,8 @@ function mapSdkEvent(event: unknown): MappedEvent {
       e.rate_limit_info && typeof e.rate_limit_info === "object"
         ? (e.rate_limit_info as Record<string, unknown>)
         : undefined;
-    const state = recordRateLimitInfo(rawInfo);
-    const note = maybeRateLimitNote(state, rawInfo);
+    const state = recordRateLimitInfo(rawInfo, account.provider);
+    const note = maybeRateLimitNote(state, rawInfo, account.provider);
     return note ? { kind: "reasoning", text: note } : { kind: "ignore" };
   }
 
@@ -1885,7 +2099,7 @@ function mapSdkEvent(event: unknown): MappedEvent {
     // this event can activate the shared countdown/gate in time.
     const errorText = assistantErrorText(e);
     if (errorText) {
-      const limited = recordRateLimitErrorText(errorText);
+      const limited = recordRateLimitErrorText(errorText, account.provider);
       let note = errorText;
       const until = limited?.limitedUntil ?? limited?.resetsAt;
       if (until !== undefined) {
@@ -1896,7 +2110,7 @@ function mapSdkEvent(event: unknown): MappedEvent {
             : ""
         }`;
       }
-      return { kind: "error", text: note, usage };
+      return { kind: "error", text: withAccountSwitchHint(note, account), usage };
     }
     if (usage) {
       return {
@@ -1918,7 +2132,7 @@ function mapSdkEvent(event: unknown): MappedEvent {
             ? e.error
             : "Claude turn failed";
       // Hard subscription limit? Record it so the gate + counter activate.
-      const limited = recordRateLimitErrorText(text);
+      const limited = recordRateLimitErrorText(text, account.provider);
       let note = text;
       if (limited?.limited) {
         const until = limited.limitedUntil ?? limited.resetsAt;
@@ -1930,6 +2144,7 @@ function mapSdkEvent(event: unknown): MappedEvent {
               : ""
           }`;
         }
+        note = withAccountSwitchHint(note, account);
       }
       return { kind: "error", text: note, usage };
     }

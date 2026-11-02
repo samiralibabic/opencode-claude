@@ -11,6 +11,8 @@ export type ClaudeSessionBinding = {
   foreignSessionId: string;
   modelId?: string;
   cwd?: string;
+  /** Provider ID of the Claude account that last ran this session. */
+  account?: string;
   updatedAt: number;
 };
 
@@ -43,14 +45,19 @@ function writeStore(store: Record<string, ClaudeSessionBinding>): void {
 export function getForeignSessionId(
   conversationKey: string,
 ): string | undefined {
-  const entry = readStore()[conversationKey];
-  return entry?.foreignSessionId;
+  return getSessionBinding(conversationKey)?.foreignSessionId;
+}
+
+export function getSessionBinding(
+  conversationKey: string,
+): ClaudeSessionBinding | undefined {
+  return readStore()[conversationKey];
 }
 
 export function setForeignSessionId(
   conversationKey: string,
   foreignSessionId: string,
-  meta?: { modelId?: string; cwd?: string },
+  meta?: { modelId?: string; cwd?: string; account?: string },
 ): void {
   const store = readStore();
   store[conversationKey] = {
@@ -58,6 +65,7 @@ export function setForeignSessionId(
     foreignSessionId,
     modelId: meta?.modelId,
     cwd: meta?.cwd,
+    ...(meta?.account ? { account: meta.account } : {}),
     updatedAt: Date.now(),
   };
   writeStore(store);
@@ -101,13 +109,16 @@ export function conversationKeyFromMessages(
  * load the session it fails the turn with "No conversation found" (see
  * forgetDeadSession in proxy.ts), so callers transfer the history into the
  * prompt when no folder has the file.
+ *
+ * `configDir` is the config home of the account about to resume: another
+ * account's transcripts are only visible when both share `projects/`.
  */
 export function findClaudeSessionFile(
   foreignSessionId: string,
+  configDir: string = process.env.CLAUDE_CONFIG_DIR || join(homedir(), ".claude"),
 ): string | null {
   const id = foreignSessionId.trim();
   if (!id) return null;
-  const configDir = process.env.CLAUDE_CONFIG_DIR || join(homedir(), ".claude");
   const projectsDir = join(configDir, "projects");
   let projectDirs: string[];
   try {

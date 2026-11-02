@@ -119,6 +119,38 @@ Signing in is either the link and its code or the terminal command — the sign-
 
 The plugin does not implement OAuth, inspect Claude credential files, inject tokens, or call Anthropic inference endpoints directly.
 
+## Several Claude accounts
+
+Each extra subscription becomes its own provider with the same models, signed in under its own `CLAUDE_CONFIG_DIR` (the CLI keeps a separate login and Keychain entry per directory). Pick the account per session in the model picker; switching keeps the OpenCode session.
+
+1. Give the account a config home that shares Claude's session history, then sign in:
+
+   ```bash
+   mkdir -p ~/.claude-2 && ln -s ~/.claude/projects ~/.claude-2/projects
+   CLAUDE_CONFIG_DIR=~/.claude-2 claude auth login --claudeai
+   ```
+
+2. Declare it in the global config (the list applies to every project) and restart OpenCode:
+
+   ```jsonc
+   {
+     "plugin": [
+       ["@openchamber/opencode-claude", {
+         "accounts": [{ "provider": "claude-code-2", "configDir": "~/.claude-2" }]
+       }]
+     ]
+   }
+   ```
+
+| Behaviour | Detail |
+| --- | --- |
+| Names | `name` from the option, else `Claude · <sign-in email>`; a `provider.<id>.name` in config wins |
+| Switching a session | Resumes the same Claude session when both config homes share `projects/`; otherwise transfers the history into the prompt (the startup log says so) |
+| Switching mid-turn | A message queued after switching ends the open turn and starts it again on the new account, with the history transferred |
+| Limits | Tracked per account (`rate-limit.<provider>.json`, `GET /v1/rate-limit?account=<provider>`); limit errors name the other accounts |
+| Subagents | A subagent pinned to a Claude account runs on its parent's current Claude account, same model and variant; non-Claude pins stay |
+| Signed out | Startup log and auth errors give the account's `CLAUDE_CONFIG_DIR=… claude auth login --claudeai` |
+
 ## Architecture
 
 ```text
