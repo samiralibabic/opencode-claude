@@ -212,20 +212,25 @@ export function addUniqueAssistantUsage(
 
 /**
  * Combine the per-response accumulated usage (one entry per Anthropic API
- * call seen during this HTTP response) with the SDK `result` snapshot.
+ * call seen during this HTTP response) with the SDK result snapshot.
  *
- * The accumulated value is the correct per-response accounting; the result
- * snapshot is cumulative for the whole Claude query (all prior turns of a
- * resumed/continued session included) and would double-count. It is only a
- * fallback for turns where no assistant events were observed, plus a donor
- * for cost/model breakdown metadata.
+ * The accumulated value is authoritative for a continued Claude query. Its
+ * terminal result is cumulative across earlier OpenCode steps, so callers may
+ * permit the result fallback/metadata only for a new, successful one-shot
+ * query where that snapshot belongs to this response.
  */
 export function resolveTurnUsage(
   accumulated: OpenAIUsage | null,
   result: OpenAIUsage | null,
+  options?: {
+    allowResultFallback?: boolean;
+    includeResultMetadata?: boolean;
+  },
 ): OpenAIUsage | null {
-  if (!accumulated) return result;
-  if (!result) return accumulated;
+  const allowResultFallback = options?.allowResultFallback ?? true;
+  const includeResultMetadata = options?.includeResultMetadata ?? true;
+  if (!accumulated) return allowResultFallback ? result : null;
+  if (!result || !includeResultMetadata) return accumulated;
   return {
     ...accumulated,
     ...(accumulated.cost_usd === undefined && result.cost_usd !== undefined
