@@ -1413,8 +1413,13 @@ async function collectTurnResponse(
 
   let content = "";
   let reasoning = "";
+  // Assistant usage is remembered for this parked bridge. Once any prior
+  // step reported it, the SDK result snapshot is cumulative and cannot stand
+  // in for a later step with no new assistant event.
+  const hadPriorAssistantUsage = bridge.seenAssistantUsageIds.size > 0;
   let turnUsage: OpenAIUsage | null = null;
   let resultUsage: OpenAIUsage | null = null;
+  let sawError = false;
   let lastErrorNorm: string | null = null;
   let errorText: string | null = null;
   let sawContent = false;
@@ -1450,7 +1455,8 @@ async function collectTurnResponse(
         resultUsage = mapped.usage;
       } else if (mapped.kind === "error") {
         // SDK emits the failure twice (result event + iterator throw) —
-        // keep one copy, and keep any usage that came with it.
+        // keep one copy. Its result usage is cumulative, not this step.
+        sawError = true;
         if (mapped.usage) resultUsage = mapped.usage;
         forgetDeadSession(bridge.conversationKey, mapped.text);
         noteError(mapped.text);
@@ -1458,12 +1464,16 @@ async function collectTurnResponse(
     }
   } catch (err) {
     const message = err instanceof Error ? err.message : String(err);
+    sawError = true;
     recordRateLimitErrorText(message, bridge.account.provider);
     forgetDeadSession(bridge.conversationKey, message);
     noteError(message);
   }
 
-  const usage = resolveTurnUsage(turnUsage, resultUsage);
+  const usage = resolveTurnUsage(turnUsage, resultUsage, {
+    allowResultFallback: !sawError && !hadPriorAssistantUsage,
+    includeResultMetadata: !sawError && !hadPriorAssistantUsage,
+  });
 
   // Buffered responses have not committed HTTP headers yet. Even if an agent
   // produced partial work first, preserve the real 429 so OpenCode starts its
@@ -1782,8 +1792,10 @@ function streamOpenAIResponse(
       });
 
       let finishReason: string | null = "stop";
+      const hadPriorAssistantUsage = bridge.seenAssistantUsageIds.size > 0;
       let turnUsage: OpenAIUsage | null = null;
       let resultUsage: OpenAIUsage | null = null;
+      let sawError = false;
       let lastErrorNorm: string | null = null;
       const sendError = (text: string) => {
         const norm = normalizeClaudeErrorText(text);
@@ -1910,6 +1922,7 @@ function streamOpenAIResponse(
 
           if (mapped.kind === "error") {
             finishReason = "stop";
+            sawError = true;
             if (mapped.usage) resultUsage = mapped.usage;
             forgetDeadSession(bridge.conversationKey, mapped.text);
             log.warn("[opencode-claude] mid-stream turn error", {
@@ -1922,6 +1935,7 @@ function streamOpenAIResponse(
         }
       } catch (err) {
         const message = err instanceof Error ? err.message : String(err);
+        sawError = true;
         // A limit/result failure typically arrives here right after the SDK
         // emitted the same text as a result event — dedupe via sendError.
         recordRateLimitErrorText(message, bridge.account.provider);
@@ -1935,7 +1949,10 @@ function streamOpenAIResponse(
         finishReason = "stop";
       }
 
-      const usage = resolveTurnUsage(turnUsage, resultUsage);
+      const usage = resolveTurnUsage(turnUsage, resultUsage, {
+        allowResultFallback: !sawError && !hadPriorAssistantUsage,
+        includeResultMetadata: !sawError && !hadPriorAssistantUsage,
+      });
       if (!streamClosed) {
         send({
           id: completionId,

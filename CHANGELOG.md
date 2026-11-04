@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.15.1 - 2026-11-04
+
+- **Fix: per-step token usage after a failed or replayed continuation**: a terminal SDK result is cumulative for a parked Claude query, not the current OpenCode step. Continued steps now report only new assistant-event usage; a step with none omits usage (including cumulative cost/model data), while a successful one-shot utility request can still use its result usage.
+
 ## 0.15.0 - 2026-11-02
 
 First release of the fork as `@samiralibabic/opencode-claude`, for OpenCode 1. Upstream `@openchamber/opencode-claude` requires OpenCode 2 since 1.0 and was archived on 2026-10-31; this continues its `0.14.0` release.
