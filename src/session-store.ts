@@ -13,6 +13,11 @@ export type ClaudeSessionBinding = {
   cwd?: string;
   /** Provider ID of the Claude account that last ran this session. */
   account?: string;
+  /**
+   * Key of the skills list (skills.ts) the Claude session has in context:
+   * sent in it and not compacted away since. Absent when it has none.
+   */
+  skillsListing?: string;
   updatedAt: number;
 };
 
@@ -57,7 +62,7 @@ export function getSessionBinding(
 export function setForeignSessionId(
   conversationKey: string,
   foreignSessionId: string,
-  meta?: { modelId?: string; cwd?: string; account?: string },
+  meta?: { modelId?: string; cwd?: string; account?: string; skillsListing?: string },
 ): void {
   const store = readStore();
   store[conversationKey] = {
@@ -66,6 +71,7 @@ export function setForeignSessionId(
     modelId: meta?.modelId,
     cwd: meta?.cwd,
     ...(meta?.account ? { account: meta.account } : {}),
+    ...(meta?.skillsListing ? { skillsListing: meta.skillsListing } : {}),
     updatedAt: Date.now(),
   };
   writeStore(store);

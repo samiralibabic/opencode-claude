@@ -812,10 +812,31 @@ export function buildConversationTranscript(
 }
 
 /**
- * Prepend a transferred-history block to a prompt. Text prompts get a plain
- * prefix; multimodal prompts get an extra leading text block so attachments
- * still reach Claude.
+ * Put text in front of a prompt: a plain prefix for text prompts, an extra
+ * leading text block for multimodal prompts so attachments still reach
+ * Claude.
  */
+function prependText(
+  prompt: string | SdkUserPrompt,
+  text: string,
+  separator: string,
+): string | SdkUserPrompt {
+  if (typeof prompt === "string") {
+    return `${text}${separator}${prompt}`;
+  }
+  const content = Array.isArray(prompt.message.content)
+    ? prompt.message.content
+    : [];
+  return {
+    ...prompt,
+    message: {
+      role: "user",
+      content: [{ type: "text", text }, ...content],
+    },
+  };
+}
+
+/** Prepend a transferred-history block to a prompt. */
 export function withConversationContext(
   prompt: string | SdkUserPrompt,
   transcript: string,
@@ -830,17 +851,17 @@ export function withConversationContext(
     "the history.\n\n" +
     body +
     "\n</conversation_history>\n\nLatest user message:\n";
-  if (typeof prompt === "string") {
-    return prefix + prompt;
-  }
-  const content = Array.isArray(prompt.message.content)
-    ? prompt.message.content
-    : [];
-  return {
-    ...prompt,
-    message: {
-      role: "user",
-      content: [{ type: "text", text: prefix }, ...content],
-    },
-  };
+  return prependText(prompt, prefix, "");
+}
+
+/**
+ * Prepend a <system-reminder> (OpenCode's skills list, see skills.ts) to a
+ * prompt, before any transferred history, as Claude Code places its own.
+ */
+export function withSystemReminder(
+  prompt: string | SdkUserPrompt,
+  reminder: string,
+): string | SdkUserPrompt {
+  const text = reminder.trim();
+  return text ? prependText(prompt, text, "\n\n") : prompt;
 }

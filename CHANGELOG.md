@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.16.0 - 2026-11-17
+
+- **Skills announced in the conversation**: OpenCode's skills list moves out of the appended system prompt into a `<system-reminder>` in the conversation, one `name: description` line per skill, the way Claude Code announces its own skills. A Claude session gets it when it starts (also when OpenCode's history is carried into a new session), again after Claude Code compacts the conversation (with the next tool result, or the next prompt), and on resume when it started before the list moved or the list changed. The skill tool's description follows Claude Code's Skill tool: load a skill first when the task, or a step about to be taken (branch, push, pull request, interface change), is one a listed skill covers. Behind the long appended system prompt Claude rarely loaded a skill unless the user's message named it. Turns without OpenCode's skill tool keep the list in the system prompt.
+
 ## 0.15.1 - 2026-11-04
 
 - **Fix: per-step token usage after a failed or replayed continuation**: a terminal SDK result is cumulative for a parked Claude query, not the current OpenCode step. Continued steps now report only new assistant-event usage; a step with none omits usage (including cumulative cost/model data), while a successful one-shot utility request can still use its result usage.
