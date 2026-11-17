@@ -55,6 +55,13 @@ import {
 import { log } from "./log.js";
 import { openCodeContext, openCodeContextPrompt } from "./opencode-context.js";
 import {
+  SKILL_TOOL,
+  SKILL_TOOL_DESCRIPTION,
+  skillsListingKey,
+  skillsReminder,
+  takeSkills,
+} from "./skills.js";
+import {
   getRateLimitSnapshot,
   maybeRateLimitNote,
   normalizeClaudeErrorText,
@@ -77,6 +84,7 @@ import {
   promptAsStream,
   withConversationContext,
   withSteering,
+  withSystemReminder,
   type AnthropicContentBlock,
   type McpToolResultContent,
   type SdkUserPrompt,
@@ -585,14 +593,22 @@ async function handleChatCompletions(
     );
     const steeringToolId =
       freshSteering.length > 0 ? resolvable.at(-1) : undefined;
+    // Claude Code compacted the conversation since the skills list was
+    // sent: the last result resolved now carries it again.
+    const skillsToolId =
+      existing.skills && !existing.skills.inContext ? resolvable.at(-1) : undefined;
     // Must run before the loop below resolves (and forgets) the tools.
     const toolDeferred = attachPromotedToolMedia(messages, toolResults, existing);
     for (const [toolId, tool] of existing.pendingTools) {
       const result = toolResults.get(toolId);
       if (result !== undefined) {
-        tool.resolve(
-          toolId === steeringToolId ? withSteering(result, freshSteering) : result,
-        );
+        let delivered =
+          toolId === steeringToolId ? withSteering(result, freshSteering) : result;
+        if (toolId === skillsToolId && existing.skills) {
+          delivered = [...delivered, { type: "text", text: existing.skills.reminder }];
+          existing.skills.inContext = true;
+        }
+        tool.resolve(delivered);
         existing.pendingTools.delete(toolId);
         resolved++;
       }
@@ -828,17 +844,40 @@ async function handleChatCompletions(
       historyMessages: priorMessagesOf(messages).length,
     });
   }
-  const contextualPrompt = withConversationContext(prompt, transcript);
-
-  const mcpServers =
-    !isMetaRequest && openCodeTools.length > 0
-      ? await buildOpenCodeMcpServer(openCodeTools, pendingTools, notifyPark)
-      : undefined;
 
   const bridgeOpenCodeTools = !isMetaRequest && openCodeTools.length > 0;
   const openCodeToolNames = openCodeTools
     .map((t) => t.function?.name)
     .filter((n): n is string => typeof n === "string" && n.length > 0);
+
+  // OpenCode's skills list travels in the conversation when the skill tool
+  // is bridged (skills.ts). A Claude session gets it when it starts, and on
+  // resume when it does not have this list in context: compacted away, or
+  // started before the list moved or changed.
+  const openCode = isMetaRequest ? null : openCodeContext(messages);
+  const takenSkills =
+    openCode && bridgeOpenCodeTools && openCodeToolNames.includes(SKILL_TOOL)
+      ? takeSkills(openCode)
+      : null;
+  const reminder = takenSkills ? skillsReminder(takenSkills.skills) : "";
+  const skillsState = reminder
+    ? { reminder, key: skillsListingKey(reminder), inContext: true }
+    : undefined;
+  const sendSkills =
+    !!skillsState && (!resume || binding?.skillsListing !== skillsState.key);
+  const contextualPrompt = withSystemReminder(
+    withConversationContext(prompt, transcript),
+    sendSkills ? reminder : "",
+  );
+
+  const mcpServers = bridgeOpenCodeTools
+    ? await buildOpenCodeMcpServer(
+        openCodeTools,
+        pendingTools,
+        notifyPark,
+        skillsState ? { [SKILL_TOOL]: SKILL_TOOL_DESCRIPTION } : {},
+      )
+    : undefined;
   const toolAliases = bridgeOpenCodeTools
     ? Object.fromEntries(
         openCodeToolNames.flatMap((name) => {
@@ -908,11 +947,12 @@ async function handleChatCompletions(
       ].join(" ")
     : "";
   // OpenCode is the only source of instructions: its agent prompt, AGENTS.md
-  // files, skills, MCP notes and plugin additions travel here, and Claude
-  // Code loads no CLAUDE.md, memory or settings of its own.
-  const chatAppend = isMetaRequest
+  // files, MCP notes and plugin additions travel here (the skills list too,
+  // unless it moved into the conversation above), and Claude Code loads no
+  // CLAUDE.md, memory or settings of its own.
+  const chatAppend = !openCode
     ? ""
-    : [bridgeNote, ...openCodeContextPrompt(openCodeContext(messages))]
+    : [bridgeNote, ...openCodeContextPrompt(takenSkills?.context ?? openCode)]
         .filter(Boolean)
         .join("\n\n");
   handle = await queryStarter({
@@ -970,6 +1010,7 @@ async function handleChatCompletions(
     forwardedSteering: new Set(),
     forwardedMedia: new Set(),
     followUps: [],
+    skills: skillsState,
     createdAt: Date.now(),
   };
   putBridge(bridge);
@@ -1089,12 +1130,14 @@ async function handleChatCompletions(
         if (raced.value.done) break;
         const event = raced.value.value;
         trackMessageState(event);
+        if (bridge.skills && isCompactBoundary(event)) bridge.skills.inContext = false;
         const sessionId = extractSessionId(event);
         if (sessionId && !isMetaRequest) {
           setForeignSessionId(conversationKey, sessionId, {
             modelId: model,
             cwd,
             account: account.provider,
+            skillsListing: bridge.skills?.inContext ? bridge.skills.key : undefined,
           });
         }
         if (isResultEvent(event) && promptChannel) {
@@ -1163,6 +1206,13 @@ function isResultEvent(event: unknown): boolean {
     typeof event === "object" &&
     (event as { type?: unknown }).type === "result"
   );
+}
+
+/** Claude Code compacted the conversation (auto-compact). */
+function isCompactBoundary(event: unknown): boolean {
+  if (!event || typeof event !== "object") return false;
+  const e = event as { type?: unknown; subtype?: unknown };
+  return e.type === "system" && e.subtype === "compact_boundary";
 }
 
 function isErrorResult(event: unknown): boolean {
@@ -1251,6 +1301,8 @@ async function buildOpenCodeMcpServer(
   tools: OpenAITool[],
   pendingTools: Map<string, ParkedToolCall>,
   onPark: () => void,
+  /** Descriptions that replace OpenCode's, by tool name. */
+  descriptions: Record<string, string> = {},
 ): Promise<Record<string, unknown> | undefined> {
   try {
     const sdk = await import("@anthropic-ai/claude-agent-sdk");
@@ -1312,7 +1364,8 @@ async function buildOpenCodeMcpServer(
       .map((t) => {
         const name = t.function?.name;
         if (!name) return null;
-        const description = fitToolDescription(t.function?.description || name);
+        const description =
+          descriptions[name] ?? fitToolDescription(t.function?.description || name);
         const params = normalizeToolParameters(t.function?.parameters);
         const annotations = PARALLEL_SAFE_TOOLS.has(name)
           ? { readOnlyHint: true as const }
@@ -2066,7 +2119,7 @@ function mapSdkEvent(event: unknown, account: ClaudeAccount): MappedEvent {
   }
 
   // Auto-compact boundary — surface as a short reasoning note for the UI.
-  if (e.type === "system" && e.subtype === "compact_boundary") {
+  if (isCompactBoundary(e)) {
     return {
       kind: "reasoning",
       text: formatCompactNote(e.compact_metadata),

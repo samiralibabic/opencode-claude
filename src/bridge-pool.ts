@@ -32,6 +32,12 @@ export type ParkedBridge = {
    * follow-up message when the current turn ends.
    */
   followUps: AnthropicContentBlock[];
+  /**
+   * OpenCode's skills list as a reminder (skills.ts) when this turn bridges
+   * the skill tool. `inContext` turns false when Claude Code compacts the
+   * conversation; the next tool result then carries the reminder again.
+   */
+  skills?: { reminder: string; key: string; inContext: boolean };
   createdAt: number;
   /**
    * Torn down because OpenCode abandoned the turn (Esc-Esc / client went
