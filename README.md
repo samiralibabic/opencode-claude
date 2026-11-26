@@ -35,7 +35,7 @@ OpenCode tools bridge as in-process MCP. Calls park and resume instead of deadlo
 
 ### Attachments, compact, and history
 
-Images and PDFs from OpenCode reach Claude (data URLs and remote URLs). Long sessions auto-compact like Claude Code. When a Claude session cannot be resumed, the prior conversation is serialized into the prompt so Claude does not start blind.
+Images and PDFs from OpenCode reach Claude (data URLs and remote URLs). Long sessions auto-compact like Claude Code. After OpenCode compacts a session, the skills it loaded come back in the next Claude session, as Claude Code re-attaches its own. When a Claude session cannot be resumed, the prior conversation is serialized into the prompt so Claude does not start blind.
 
 ### Rate-limit counter
 
