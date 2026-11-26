@@ -47,9 +47,12 @@ import {
 import { startClaudeQuery, type ClaudeQueryHandle } from "./query.js";
 import {
   clearForeignSessionId,
+  clearSkillsReattach,
   conversationKeyFromMessages,
   findClaudeSessionFile,
+  getLoadedSkills,
   getSessionBinding,
+  recordLoadedSkill,
   setForeignSessionId,
 } from "./session-store.js";
 import { log } from "./log.js";
@@ -57,6 +60,10 @@ import { openCodeContext, openCodeContextPrompt } from "./opencode-context.js";
 import {
   SKILL_TOOL,
   SKILL_TOOL_DESCRIPTION,
+  estimateTokens,
+  loadedSkillFromResult,
+  loadedSkillsReminder,
+  selectLoadedSkills,
   skillsListingKey,
   skillsReminder,
   takeSkills,
@@ -602,6 +609,7 @@ async function handleChatCompletions(
     for (const [toolId, tool] of existing.pendingTools) {
       const result = toolResults.get(toolId);
       if (result !== undefined) {
+        if (tool.name === SKILL_TOOL) rememberLoadedSkill(existing.conversationKey, result);
         let delivered =
           toolId === steeringToolId ? withSteering(result, freshSteering) : result;
         if (toolId === skillsToolId && existing.skills) {
@@ -865,8 +873,35 @@ async function handleChatCompletions(
     : undefined;
   const sendSkills =
     !!skillsState && (!resume || binding?.skillsListing !== skillsState.key);
+  // OpenCode compacted the session since its last Claude session: the skills
+  // it loaded before come back once, in the new Claude session, after the
+  // list (skills.ts). A skill whose whole content the history still carries
+  // stays there.
+  // Never fails the turn: without them, it goes on as 0.16.0 did.
+  let reattachSkills = false;
+  let loadedReminder = "";
+  try {
+    const loadedSkills =
+      !isMetaRequest && !resume ? getLoadedSkills(conversationKey) : undefined;
+    const reattached = loadedSkills?.reattach === true
+      ? selectLoadedSkills(loadedSkills.skills, (content) => transcript.includes(content))
+      : [];
+    loadedReminder = loadedSkillsReminder(reattached);
+    reattachSkills = loadedSkills?.reattach === true;
+    if (reattachSkills) {
+      log.info("[opencode-claude] re-attaching skills loaded before the compaction", {
+        conversationKey,
+        skills: reattached.map((skill) => skill.name),
+        tokens: estimateTokens(loadedReminder),
+      });
+    }
+  } catch (error) {
+    reattachSkills = false;
+    loadedReminder = "";
+    log.warn("[opencode-claude] could not re-attach the skills loaded before the compaction", error);
+  }
   const contextualPrompt = withSystemReminder(
-    withConversationContext(prompt, transcript),
+    withSystemReminder(withConversationContext(prompt, transcript), loadedReminder),
     sendSkills ? reminder : "",
   );
 
@@ -1000,6 +1035,9 @@ async function handleChatCompletions(
     };
   }
 
+  // Cleared once the new Claude session exists; a turn that fails before
+  // that leaves the skills for the next one.
+  let reattachPending = reattachSkills;
   const bridge: ParkedBridge = {
     id: bridgeId,
     conversationKey,
@@ -1133,12 +1171,26 @@ async function handleChatCompletions(
         if (bridge.skills && isCompactBoundary(event)) bridge.skills.inContext = false;
         const sessionId = extractSessionId(event);
         if (sessionId && !isMetaRequest) {
-          setForeignSessionId(conversationKey, sessionId, {
-            modelId: model,
-            cwd,
-            account: account.provider,
-            skillsListing: bridge.skills?.inContext ? bridge.skills.key : undefined,
-          });
+          // Claude has started the turn: a store that can't be written must
+          // not fail it.
+          try {
+            setForeignSessionId(conversationKey, sessionId, {
+              modelId: model,
+              cwd,
+              account: account.provider,
+              skillsListing: bridge.skills?.inContext ? bridge.skills.key : undefined,
+            });
+          } catch (error) {
+            log.warn("[opencode-claude] could not store the Claude session binding", error);
+          }
+          if (reattachPending) {
+            reattachPending = false;
+            try {
+              clearSkillsReattach(conversationKey);
+            } catch (error) {
+              log.warn("[opencode-claude] could not clear the skills re-attach mark", error);
+            }
+          }
         }
         if (isResultEvent(event) && promptChannel) {
           if (bridge.followUps.length > 0 && !isErrorResult(event)) {
@@ -1206,6 +1258,20 @@ function isResultEvent(event: unknown): boolean {
     typeof event === "object" &&
     (event as { type?: unknown }).type === "result"
   );
+}
+
+/**
+ * A skill tool result reached Claude: remember the skill it loaded for the
+ * session (skills.ts). Never lets a store failure fail the turn.
+ */
+function rememberLoadedSkill(conversationKey: string, result: McpToolResultContent[]): void {
+  try {
+    const text = result.map((block) => (block.type === "text" ? block.text : "")).join("\n");
+    const loaded = loadedSkillFromResult(text);
+    if (loaded) recordLoadedSkill(conversationKey, { ...loaded, loadedAt: Date.now() });
+  } catch (error) {
+    log.warn("[opencode-claude] could not record a loaded skill", error);
+  }
 }
 
 /** Claude Code compacted the conversation (auto-compact). */

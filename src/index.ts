@@ -37,7 +37,7 @@ import {
 } from "./cli-login.js";
 import { log } from "./log.js";
 import { requestKeyNamespace } from "./request-kind.js";
-import { clearForeignSessionId } from "./session-store.js";
+import { clearForeignSessionId, markSkillsForReattach } from "./session-store.js";
 import {
   encodeClaudeModelSelection,
   resolveClaudeModelSelection,
@@ -366,7 +366,8 @@ export const ClaudeCodePlugin: Plugin = async (
     },
 
     // session.idle: drop turns OpenCode abandoned (teardownBridgesForSession).
-    // session.compacted: drop the pre-summary Claude session.
+    // session.compacted: drop the pre-summary Claude session; the skills it
+    // loaded come back with the next one (skills.ts).
     async event({ event }) {
       const busEvent = event as unknown as {
         type?: unknown;
@@ -384,6 +385,7 @@ export const ClaudeCodePlugin: Plugin = async (
           const bridge = findBridgeByConversation(sessionID);
           if (bridge) deleteBridge(bridge.id);
           clearForeignSessionId(sessionID);
+          markSkillsForReattach(sessionID);
         } catch (error) {
           log.error("[opencode-claude] failed to reset Claude session after compaction", error);
         }

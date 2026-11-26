@@ -2,9 +2,10 @@
  * Sticky foreign Claude session IDs for Agent SDK resume
  * (OpenChamber harness session-bindings pattern, scoped to this proxy).
  */
-import { existsSync, mkdirSync, readFileSync, readdirSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, readdirSync, renameSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { dirname, join } from "node:path";
+import { selectLoadedSkills, type LoadedSkill } from "./skills.js";
 
 export type ClaudeSessionBinding = {
   conversationKey: string;
@@ -82,6 +83,142 @@ export function clearForeignSessionId(conversationKey: string): void {
   if (!(conversationKey in store)) return;
   delete store[conversationKey];
   writeStore(store);
+}
+
+/**
+ * Skills an OpenCode session loaded (skills.ts), kept so they can come back
+ * after OpenCode compacts the session. They live next to the bindings, in
+ * their own file: a binding goes whenever its Claude session does (missing
+ * transcript, account move, compaction), the skills stay with the OpenCode
+ * session.
+ */
+export type LoadedSkillsRecord = {
+  conversationKey: string;
+  /** Newest first, one per name, capped and within budget as when sent. */
+  skills: LoadedSkill[];
+  /** Compacted since: the next new Claude session gets the skills back. */
+  reattach?: boolean;
+  updatedAt: number;
+};
+
+/** Sessions kept; the least recently updated go first. */
+const MAX_LOADED_SKILL_SESSIONS = 200;
+
+function loadedSkillsPath(): string {
+  return join(dirname(storePath()), "loaded-skills.json");
+}
+
+/**
+ * Records and skills of the wrong shape (an edit by hand, another version)
+ * are dropped as the file is read, so they can't fail the session's turns,
+ * and the session's next load writes a sound record again.
+ */
+function readLoadedSkills(): Record<string, LoadedSkillsRecord> {
+  const path = loadedSkillsPath();
+  if (!existsSync(path)) return {};
+  try {
+    const parsed = JSON.parse(readFileSync(path, "utf8")) as unknown;
+    if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) return {};
+    const store: Record<string, LoadedSkillsRecord> = {};
+    for (const [key, value] of Object.entries(parsed)) {
+      const record = soundLoadedSkillsRecord(key, value);
+      if (record) store[key] = record;
+    }
+    return store;
+  } catch {
+    return {};
+  }
+}
+
+function soundLoadedSkillsRecord(key: string, value: unknown): LoadedSkillsRecord | null {
+  if (!value || typeof value !== "object") return null;
+  const record = value as Partial<LoadedSkillsRecord>;
+  const skills = Array.isArray(record.skills) ? record.skills.filter(isLoadedSkill) : [];
+  if (skills.length === 0) return null;
+  return {
+    conversationKey: key,
+    skills,
+    ...(record.reattach === true ? { reattach: true } : {}),
+    updatedAt: Number.isFinite(record.updatedAt) ? record.updatedAt! : 0,
+  };
+}
+
+function isLoadedSkill(value: unknown): value is LoadedSkill {
+  if (!value || typeof value !== "object") return false;
+  const skill = value as Partial<LoadedSkill>;
+  return (
+    typeof skill.name === "string" &&
+    skill.name.length > 0 &&
+    typeof skill.content === "string" &&
+    Number.isFinite(skill.loadedAt)
+  );
+}
+
+/**
+ * Written whole and renamed into place: every OpenCode process on the machine
+ * shares the file, and one that read it half-written would find no records
+ * and write back only its own.
+ */
+function writeLoadedSkills(store: Record<string, LoadedSkillsRecord>): void {
+  const path = loadedSkillsPath();
+  mkdirSync(dirname(path), { recursive: true });
+  const partial = `${path}.${process.pid}.tmp`;
+  writeFileSync(partial, JSON.stringify(store, null, 2) + "\n", "utf8");
+  renameSync(partial, path);
+}
+
+export function getLoadedSkills(
+  conversationKey: string,
+): LoadedSkillsRecord | undefined {
+  return readLoadedSkills()[conversationKey];
+}
+
+/** The session loaded a skill: its newest version replaces any older one. */
+export function recordLoadedSkill(
+  conversationKey: string,
+  skill: LoadedSkill,
+): void {
+  const store = readLoadedSkills();
+  const previous = store[conversationKey];
+  store[conversationKey] = {
+    conversationKey,
+    skills: selectLoadedSkills([
+      skill,
+      ...(previous?.skills ?? []).filter((s) => s.name !== skill.name),
+    ]),
+    ...(previous?.reattach ? { reattach: true } : {}),
+    updatedAt: Date.now(),
+  };
+  const keys = Object.keys(store);
+  if (keys.length > MAX_LOADED_SKILL_SESSIONS) {
+    keys
+      .sort((a, b) => store[a]!.updatedAt - store[b]!.updatedAt)
+      .slice(0, keys.length - MAX_LOADED_SKILL_SESSIONS)
+      .forEach((key) => delete store[key]);
+  }
+  writeLoadedSkills(store);
+}
+
+/** OpenCode compacted the session: its skills come back with the next new Claude session. */
+export function markSkillsForReattach(conversationKey: string): void {
+  const store = readLoadedSkills();
+  const record = store[conversationKey];
+  if (!record || record.skills.length === 0) return;
+  store[conversationKey] = { ...record, reattach: true, updatedAt: Date.now() };
+  writeLoadedSkills(store);
+}
+
+/** A new Claude session got the skills back. */
+export function clearSkillsReattach(conversationKey: string): void {
+  const store = readLoadedSkills();
+  const record = store[conversationKey];
+  if (!record?.reattach) return;
+  store[conversationKey] = {
+    conversationKey,
+    skills: record.skills,
+    updatedAt: Date.now(),
+  };
+  writeLoadedSkills(store);
 }
 
 /**
