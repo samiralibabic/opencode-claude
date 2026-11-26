@@ -108,18 +108,50 @@ function loadedSkillsPath(): string {
   return join(dirname(storePath()), "loaded-skills.json");
 }
 
+/**
+ * Records and skills of the wrong shape (an edit by hand, another version)
+ * are dropped as the file is read, so they can't fail the session's turns,
+ * and the session's next load writes a sound record again.
+ */
 function readLoadedSkills(): Record<string, LoadedSkillsRecord> {
   const path = loadedSkillsPath();
   if (!existsSync(path)) return {};
   try {
-    const parsed = JSON.parse(readFileSync(path, "utf8")) as Record<
-      string,
-      LoadedSkillsRecord
-    >;
-    return parsed && typeof parsed === "object" ? parsed : {};
+    const parsed = JSON.parse(readFileSync(path, "utf8")) as unknown;
+    if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) return {};
+    const store: Record<string, LoadedSkillsRecord> = {};
+    for (const [key, value] of Object.entries(parsed)) {
+      const record = soundLoadedSkillsRecord(key, value);
+      if (record) store[key] = record;
+    }
+    return store;
   } catch {
     return {};
   }
+}
+
+function soundLoadedSkillsRecord(key: string, value: unknown): LoadedSkillsRecord | null {
+  if (!value || typeof value !== "object") return null;
+  const record = value as Partial<LoadedSkillsRecord>;
+  const skills = Array.isArray(record.skills) ? record.skills.filter(isLoadedSkill) : [];
+  if (skills.length === 0) return null;
+  return {
+    conversationKey: key,
+    skills,
+    ...(record.reattach === true ? { reattach: true } : {}),
+    updatedAt: Number.isFinite(record.updatedAt) ? record.updatedAt! : 0,
+  };
+}
+
+function isLoadedSkill(value: unknown): value is LoadedSkill {
+  if (!value || typeof value !== "object") return false;
+  const skill = value as Partial<LoadedSkill>;
+  return (
+    typeof skill.name === "string" &&
+    skill.name.length > 0 &&
+    typeof skill.content === "string" &&
+    Number.isFinite(skill.loadedAt)
+  );
 }
 
 /**

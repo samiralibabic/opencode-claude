@@ -6,7 +6,7 @@
  *
  * Run: bun test/skills-in-conversation.ts
  */
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, statSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, statSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
@@ -826,6 +826,55 @@ async function reattachResume(ctx: Ctx, hooks: Hooks) {
   assert.ok(existsSync(join(ctx.tmp, "opencode-claude", "loaded-skills.json")));
 }
 
+/**
+ * A store of the wrong shape, or one that can't be written: the turn goes on
+ * without the skills, and the session's next load repairs the record.
+ */
+async function reattachBadStore(ctx: Ctx, hooks: Hooks) {
+  const { getLoadedSkills } = await import("../src/session-store.ts");
+  const dir = join(ctx.tmp, "opencode-claude");
+  const file = join(dir, "loaded-skills.json");
+  const shapes: Record<string, object> = {
+    "bad-null-skills": { reattach: true, skills: null },
+    "bad-no-skills": { reattach: true },
+    "bad-no-content": { reattach: true, skills: [{ name: "github-rules", loadedAt: 1 }] },
+  };
+  for (const [session, record] of Object.entries(shapes)) {
+    const store = JSON.parse(readFileSync(file, "utf8"));
+    store[session] = { conversationKey: session, updatedAt: Date.now(), ...record };
+    writeFileSync(file, JSON.stringify(store));
+    for (const claudeSession of [`${session}-1`, `${session}-2`]) {
+      const seen = await turn(ctx, session, claudeSession, compactedHistory("now push the branch"));
+      assert.equal(seen.params.resume, undefined);
+      assert.doesNotMatch(seen.prompt, /EARLIER in this session/, session);
+    }
+    assert.equal(getLoadedSkills(session), undefined, `${session} dropped`);
+    await loadSkillsTurn(ctx, session, `${session}-load`, [
+      ...openCodeSystem(SKILLS_V1),
+      { role: "user", content: "load the skill github-rules" },
+    ], [GITHUB_RULES]);
+    assert.equal(getLoadedSkills(session)?.skills[0]?.content, GITHUB_RULES, `${session} repaired`);
+    await compact(hooks, session);
+    const repaired = await turn(ctx, session, `${session}-3`, compactedHistory("now push the branch"));
+    assert.equal(count(repaired.prompt, GITHUB_RULES), 1);
+  }
+
+  // The store can't be written once Claude has started the turn.
+  await loadSkillsTurn(ctx, "bad-write", "bad-write-sess", [
+    ...openCodeSystem(SKILLS_V1),
+    { role: "user", content: "load the skill github-rules" },
+  ], [GITHUB_RULES]);
+  await compact(hooks, "bad-write");
+  chmodSync(dir, 0o555);
+  try {
+    const seen = await turn(ctx, "bad-write", "bad-write-sess-2", compactedHistory("now push the branch"));
+    assert.equal(count(seen.prompt, GITHUB_RULES), 1);
+  } finally {
+    chmodSync(dir, 0o755);
+  }
+  assert.equal(getLoadedSkills("bad-write")?.reattach, true, "still marked for the next new session");
+}
+
 async function main() {
   await listing();
   const ctx = await startMockedProxy("skills");
@@ -845,6 +894,7 @@ async function main() {
     await reattachCaps(ctx, hooks);
     await reattachHelper(ctx, hooks);
     await reattachResume(ctx, hooks);
+    await reattachBadStore(ctx, hooks);
   } finally {
     ctx.proxy.setClaudeQueryStarter(null);
     await ctx.proxy.stopProxy();
