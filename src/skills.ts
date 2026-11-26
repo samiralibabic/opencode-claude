@@ -114,8 +114,8 @@ export const SKILL_TOOL_DESCRIPTION = [
  * newest first, each cut to 5,000 tokens and 25,000 in total. The plugin
  * does the same with the skills it bridged.
  *
- * Tokens are estimated as characters / 4, as Claude Code does for this cut;
- * the plugin has no tokenizer. The total covers the whole reminder.
+ * The plugin has no tokenizer, so tokens are estimated as characters / 4.
+ * The total covers the whole reminder.
  */
 export const REATTACH_SKILL_TOKENS = 5_000;
 export const REATTACH_TOTAL_TOKENS = 25_000;
