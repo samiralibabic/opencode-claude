@@ -2,7 +2,7 @@
  * Sticky foreign Claude session IDs for Agent SDK resume
  * (OpenChamber harness session-bindings pattern, scoped to this proxy).
  */
-import { existsSync, mkdirSync, readFileSync, readdirSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, readdirSync, renameSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { dirname, join } from "node:path";
 import { selectLoadedSkills, type LoadedSkill } from "./skills.js";
@@ -122,10 +122,17 @@ function readLoadedSkills(): Record<string, LoadedSkillsRecord> {
   }
 }
 
+/**
+ * Written whole and renamed into place: every OpenCode process on the machine
+ * shares the file, and one that read it half-written would find no records
+ * and write back only its own.
+ */
 function writeLoadedSkills(store: Record<string, LoadedSkillsRecord>): void {
   const path = loadedSkillsPath();
   mkdirSync(dirname(path), { recursive: true });
-  writeFileSync(path, JSON.stringify(store, null, 2) + "\n", "utf8");
+  const partial = `${path}.${process.pid}.tmp`;
+  writeFileSync(partial, JSON.stringify(store, null, 2) + "\n", "utf8");
+  renameSync(partial, path);
 }
 
 export function getLoadedSkills(

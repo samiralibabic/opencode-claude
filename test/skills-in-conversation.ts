@@ -6,7 +6,7 @@
  *
  * Run: bun test/skills-in-conversation.ts
  */
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, statSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
@@ -681,6 +681,12 @@ async function reattachCaps(ctx: Ctx, hooks: Hooks) {
     const keys = Object.keys(JSON.parse(readFileSync(file, "utf8")));
     assert.equal(keys.length, 200);
     assert.ok(!keys.includes("bound-0") && keys.includes("bound-204"));
+    // Renamed into place, never rewritten: another process reading it
+    // meanwhile gets the old file or the new one, never half of one.
+    const before = statSync(file).ino;
+    recordLoadedSkill("bound-205", { name: "github-rules", content: GITHUB_RULES, loadedAt: 205 });
+    assert.notEqual(statSync(file).ino, before);
+    assert.deepEqual(readdirSync(join(process.env.XDG_DATA_HOME, "opencode-claude")), ["loaded-skills.json"]);
   } finally {
     process.env.XDG_DATA_HOME = previous;
   }
